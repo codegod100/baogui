@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=BaoGUI
+GenericName=OpenBao Client
+Comment=Simple Vidya client for OpenBao secrets
+Exec=baogui
+Icon=org.openbao.baogui
+Terminal=false
+Categories=Utility;Security;Network;
+Keywords=OpenBao;Vault;secrets;password;KV;
+StartupNotify=true
+StartupWMClass=baogui
+DBusActivatable=false
