@@ -20,6 +20,11 @@ in
       default = "smokeboxd";
       description = "VNC password (change in production).";
     };
+    enableTls = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = "Terminate TLS on smoke.boxd.sh via nginx + ACME (set email on host).";
+    };
     display = lib.mkOption {
       type = lib.types.str;
       default = ":1";
@@ -29,8 +34,8 @@ in
   config = lib.mkIf cfg.enable {
     environment.systemPackages = with pkgs; [
       tigervnc
-      websockify
       novnc
+      python3Packages.websockify
     ];
 
     systemd.services.smoke-vnc = {
@@ -69,7 +74,12 @@ in
       '';
     };
 
-    services.nginx = {
+    networking.firewall.allowedTCPPorts = lib.mkAfter (
+      [ 6080 ]
+      ++ lib.optionals cfg.enableTls [ 443 ]
+    );
+
+    services.nginx = lib.mkIf cfg.enableTls {
       enable = true;
       recommendedTlsSettings = true;
       recommendedProxySettings = true;

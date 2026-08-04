@@ -25,12 +25,19 @@
   networking.domain = "boxd.sh";
   time.timeZone = "UTC";
 
-  # Raw machine: enable SSH, open firewall for HTTPS + VNC websocket.
   services.openssh.enable = true;
-  networking.firewall.allowedTCPPorts = [
-    22
-    443
-  ];
+
+  # Open noVNC in browser (http://smoke.boxd.sh:6080/vnc.html). Enable TLS after DNS is live:
+  # services.smoke-vnc.enableTls = true;
+  # security.acme.acceptTerms = true;
+  # security.acme.defaults.email = "you@boxd.sh";
+
+  # Install-time placeholders (override in hardware-configuration.nix):
+  boot.loader.grub.devices = lib.mkDefault [ "/dev/sda" ];
+  fileSystems."/" = lib.mkDefault {
+    device = "/dev/sda1";
+    fsType = "ext4";
+  };
 
   users.users.smoke = {
     isNormalUser = true;
@@ -59,10 +66,7 @@
   # Waydroid (fastest APK runtime on Linux desktop).
   virtualisation.waydroid.enable = true;
 
-  # Desktop session viewable over VNC (Waydroid UI + manual debugging).
-  services.xserver.enable = true;
-  services.displayManager.lightdm.enable = true;
-  services.desktopManager.xfce.enable = true;
+  # Graphical sessions come from smoke-vnc (TigerVNC :1), not a local display manager.
 
   environment.systemPackages = with pkgs; [
     git
