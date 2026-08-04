@@ -200,6 +200,52 @@ impl Client {
         Ok(extract_list_keys(&value))
     }
 
+    /// Recursively LIST every leaf secret path under a KV v2 mount.
+    pub fn list_all_secret_paths(&self, mount: &str) -> Result<Vec<String>, ApiError> {
+        let mut out = Vec::new();
+        self.collect_secret_paths(mount, "", &mut out)?;
+        out.sort();
+        Ok(out)
+    }
+
+    fn collect_secret_paths(
+        &self,
+        mount: &str,
+        prefix: &str,
+        out: &mut Vec<String>,
+    ) -> Result<(), ApiError> {
+        const MAX_PATHS: usize = 2000;
+        if out.len() >= MAX_PATHS {
+            return Ok(());
+        }
+        let keys = self.list_secrets(mount, prefix)?;
+        for key in keys {
+            if out.len() >= MAX_PATHS {
+                break;
+            }
+            if key.ends_with('/') {
+                let name = key.trim_end_matches('/');
+                if name.is_empty() {
+                    continue;
+                }
+                let child = if prefix.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{prefix}/{name}")
+                };
+                self.collect_secret_paths(mount, &child, out)?;
+            } else {
+                let full = if prefix.is_empty() {
+                    key
+                } else {
+                    format!("{prefix}/{key}")
+                };
+                out.push(full);
+            }
+        }
+        Ok(())
+    }
+
     pub fn read_secret(&self, mount: &str, path: &str) -> Result<SecretData, ApiError> {
         let api_path = format!(
             "{}/data/{}",
