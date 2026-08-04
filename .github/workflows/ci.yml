@@ -1,8 +1,5 @@
-# CI: host checks (always) + optional nixbuild APK on main / when secrets are set.
+# CI: host checks + Nix APK build on GitHub Actions (no nixbuild.net).
 # APK: nix build .#android → baogui.apk → workflow artifact + summary link.
-#
-# NIXBUILD_TOKEN is fetched from OpenBao (secret/data/ai-api-keys). Falls back to
-# the repository secret nixbuild_token when OPENBAO_TOKEN is unset.
 
 name: Build
 
@@ -47,65 +44,21 @@ jobs:
   apk:
     name: APK (android)
     runs-on: ubuntu-latest
-    outputs:
-      built: ${{ steps.creds.outputs.has_token }}
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
-      - id: creds
-        env:
-          OPENBAO_TOKEN: ${{ secrets.OPENBAO_TOKEN }}
-          NIXBUILD_TOKEN_FALLBACK: ${{ secrets.nixbuild_token }}
-        run: |
-          set -euo pipefail
-          if [[ -n "${OPENBAO_TOKEN:-}" || -n "${NIXBUILD_TOKEN_FALLBACK:-}" ]]; then
-            echo "has_token=true" >>"$GITHUB_OUTPUT"
-          else
-            echo "has_token=false" >>"$GITHUB_OUTPUT"
-            echo "No nixbuild credentials — skipping APK build" >&2
-            echo "Set OPENBAO_TOKEN (preferred) or nixbuild_token repository secret" >&2
-          fi
-
-      - name: Fetch nixbuild token
-        if: steps.creds.outputs.has_token == 'true'
-        env:
-          OPENBAO_ADDR: https://openbao.boxd.sh
-          OPENBAO_TOKEN: ${{ secrets.OPENBAO_TOKEN }}
-          OPENBAO_SECRET_PATH: secret/data/ai-api-keys
-          NIXBUILD_TOKEN_FALLBACK: ${{ secrets.nixbuild_token }}
-        run: |
-          set -euo pipefail
-          if [[ -n "${OPENBAO_TOKEN:-}" ]]; then
-            chmod +x scripts/fetch-openbao-env.sh
-            ./scripts/fetch-openbao-env.sh --github-env --keys NIXBUILD_TOKEN
-          else
-            {
-              echo "NIXBUILD_TOKEN<<EOF"
-              echo "$NIXBUILD_TOKEN_FALLBACK"
-              echo "EOF"
-            } >>"$GITHUB_ENV"
-          fi
-
       - uses: nixbuild/nix-quick-install-action@v35
-        if: steps.creds.outputs.has_token == 'true'
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
           nix_conf: |
             accept-flake-config = true
             experimental-features = nix-command flakes
 
-      - uses: nixbuild/nixbuild-action@v25
-        if: steps.creds.outputs.has_token == 'true'
-        with:
-          nixbuild_token: ${{ env.NIXBUILD_TOKEN }}
-          generate_summary_for: job
-
       - name: nix build .#android
-        if: steps.creds.outputs.has_token == 'true'
         run: nix build ".#android" -L --print-build-logs --out-link result-android
 
       - name: Upload APK
-        if: steps.creds.outputs.has_token == 'true'
         id: upload-apk
         uses: actions/upload-artifact@v4
         with:
@@ -114,7 +67,6 @@ jobs:
           if-no-files-found: error
 
       - name: APK summary
-        if: steps.creds.outputs.has_token == 'true'
         run: |
           version="$(grep '^version' android/Cargo.toml | head -1 | cut -d'"' -f2)"
           {
@@ -132,7 +84,7 @@ jobs:
     needs: [apk]
     runs-on: ubuntu-latest
     if: >-
-      needs.apk.outputs.built == 'true' &&
+      needs.apk.result == 'success' &&
       (github.event_name == 'workflow_dispatch' ||
        (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     steps:
