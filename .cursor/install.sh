@@ -186,18 +186,37 @@ warm_flake() {
   nix develop "$ROOT" -c true
 }
 
+remove_starship_shell_init() {
+  local file="$1"
+  [[ -f "$file" ]] || return 0
+  local tmp
+  tmp="$(mktemp)"
+  awk '
+    /^# starship prompt \(installed by \.cursor\/install\.sh\)$/ { skip=1; next }
+    skip && /^eval "\$\(starship init bash\)"$/ { skip=0; next }
+    skip { next }
+    { print }
+  ' "$file" >"$tmp"
+  mv "$tmp" "$file"
+}
+
 ensure_starship_shell_init() {
+  local marker='# starship prompt (installed by .cursor/install.sh)'
+  local path_line='export PATH="$HOME/.local/bin:$PATH"'
   local init_line='eval "$(starship init bash)"'
-  for rc in "${HOME}/.bashrc" "${HOME}/.profile"; do
-    touch "$rc"
-    if ! grep -qF 'starship init bash' "$rc" 2>/dev/null; then
-      {
-        echo ''
-        echo '# starship prompt (installed by .cursor/install.sh)'
-        echo "$init_line"
-      } >>"$rc"
-    fi
-  done
+  local rc="${HOME}/.bashrc"
+
+  # Starship lives in ~/.local/bin; only .bashrc is sourced by non-login shells.
+  # Ubuntu .profile sources .bashrc before adding ~/.local/bin, so init belongs in bashrc.
+  remove_starship_shell_init "${HOME}/.profile"
+  remove_starship_shell_init "$rc"
+
+  {
+    echo ''
+    echo "$marker"
+    echo "$path_line"
+    echo "$init_line"
+  } >>"$rc"
 }
 
 install_starship() {
