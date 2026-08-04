@@ -60,14 +60,14 @@ sudo /opt/baogui/infra/smoke.boxd/install-raw.sh
 ./scripts/apk-smoke.sh --ci result-android/baogui.apk
 ```
 
-## CI integration
+### Provision on boxd
 
-After the host is live, add to OpenBao (`secret/data/ai-api-keys` or a dedicated path):
+```bash
+eval "$(./scripts/boxd-env.sh)"   # BOXD_API_KEY from OpenBao → JWT
+./scripts/provision-smoke-boxd.sh
+```
 
-- `SMOKE_SSH_KEY` — private key for `smoke@smoke.boxd.sh`
-- `SMOKE_HOST` — `smoke.boxd.sh` (optional override)
-
-Then trigger the workflow manually (`workflow_dispatch`) or on `main` pushes — see `.github/workflows/ci.yml` → `smoke` job.
+CI uses the same OpenBao `BOXD_API_KEY` and `boxd machine exec smoke` for APK smoke tests.
 
 ## Requirements
 
