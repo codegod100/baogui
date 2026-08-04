@@ -1,0 +1,4 @@
+{
+  "name": "baogui-nix",
+  "install": "bash .cursor/install.sh"
+}
