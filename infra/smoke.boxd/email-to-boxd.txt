@@ -1,0 +1,42 @@
+To: contact@boxd.sh
+From: nandithebull@hey.com
+Reply-To: nandithebull@hey.com
+Subject: Custom VM image: Android binder + nested KVM for APK smoke testing
+
+---
+
+Hi boxd team,
+
+I'm building BaoGUI (https://github.com/codegod100/baogui) — an OpenBao/Vault KV client — and want to use boxd VMs for automated Android APK smoke testing with a browser-viewable desktop.
+
+We provisioned smoke.boxd.sh on the default image. The VM works well for noVNC remote view, but Waydroid and the Android emulator cannot run on the stock microVM kernel:
+
+  • /dev/binder — missing (Waydroid init fails: "Binder node binder not found")
+  • /dev/kvm — missing (hardware-accelerated emulator unavailable)
+  • /lib/modules/6.1.0+/ — empty; /proc/modules absent (modprobe cannot load binder_linux)
+
+Waydroid 1.6.2 is installed; `waydroid init` fails because the guest kernel (6.1.0+, monolithic) has no loadable module tree.
+
+**Request**
+
+A custom fleet image (or kernel config on computer:latest) with:
+
+1. CONFIG_ANDROID_BINDER_IPC / binder_linux (+ ashmem if needed) so /dev/binder exists
+2. Nested KVM exposed as /dev/kvm (for x86_64 Android emulator fallback)
+3. Standard Ubuntu 24.04 userspace is fine; we need the kernel/devices
+
+**Use case**
+
+  • CI builds aarch64 APK → copies to smoke.boxd.sh → install + launch + verify process
+  • Developers view the Android UI at https://smoke.boxd.sh/vnc.html (noVNC, already working)
+  • Prefer Waydroid (fast); emulator is acceptable fallback with KVM
+
+Happy to test a beta image, share repro scripts (scripts/waydroid-proof.sh in the repo), or jump on a call.
+
+Thanks,
+nandi
+nandithebull@hey.com
+https://github.com/codegod100/baogui
+
+---
+Sent: 2026-08-04 via Hey.com web UI (nandithebull@hey.com → contact@boxd.sh)

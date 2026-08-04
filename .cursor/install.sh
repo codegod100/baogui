@@ -183,6 +183,21 @@ cargo_version_ok() {
 }
 
 ensure_rust_toolchain() {
+  # Prefer rustup's cargo over stale system toolchains (e.g. /usr/local/cargo 1.83).
+  export PATH="${HOME}/.cargo/bin:/usr/local/cargo/bin:${PATH}"
+  export CARGO_HOME="${HOME}/.cargo"
+  export RUSTUP_HOME="${HOME}/.rustup"
+
+  if ! command -v cargo >/dev/null 2>&1 && ! command -v rustup >/dev/null 2>&1; then
+    log "installing rustup..."
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --default-toolchain stable --profile minimal
+  fi
+
+  # shellcheck disable=SC1091
+  [[ -f "${HOME}/.cargo/env" ]] && . "${HOME}/.cargo/env"
+  export PATH="${HOME}/.cargo/bin:${PATH}"
+
   if ! command -v cargo >/dev/null 2>&1; then
     log "cargo not on PATH (install rustup from https://rustup.rs/)"
     return 0
@@ -199,12 +214,21 @@ ensure_rust_toolchain() {
     log "cargo $ver too old (need >= 1.85); installing stable via rustup..."
     rustup toolchain install stable
     rustup default stable
+    # shellcheck disable=SC1091
+    [[ -f "${HOME}/.cargo/env" ]] && . "${HOME}/.cargo/env"
+    export PATH="${HOME}/.cargo/bin:${PATH}"
     ver="$(cargo --version | awk '{print $2}')"
     log "cargo $ver ready"
     return 0
   fi
 
-  log "warning: cargo $ver < 1.85 and rustup not found"
+  log "warning: cargo $ver < 1.85 and rustup not found — installing rustup..."
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain stable --profile minimal
+  # shellcheck disable=SC1091
+  . "${HOME}/.cargo/env"
+  export PATH="${HOME}/.cargo/bin:${PATH}"
+  log "cargo $(cargo --version | awk '{print $2}') ready"
 }
 
 ensure_system_egui_libs() {
@@ -224,11 +248,12 @@ ensure_system_egui_libs() {
 }
 
 warm_cargo_deps() {
+  ensure_rust_toolchain
   if ! command -v cargo >/dev/null 2>&1; then
     log "skipping cargo fetch (cargo not on PATH)"
     return 0
   fi
-  log "fetching cargo dependencies..."
+  log "fetching cargo dependencies ($(cargo --version 2>&1 | head -1))..."
   cargo fetch
 }
 
