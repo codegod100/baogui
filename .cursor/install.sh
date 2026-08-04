@@ -177,12 +177,18 @@ ensure_vidya_sibling() {
   git clone --depth 1 -b main "$VIDYA_URL" "$VIDYA_DIR"
 }
 
+cargo_version_ok() {
+  local ver="${1:?}"
+  printf '%s\n%s\n' "1.85.0" "$ver" | sort -CV 2>/dev/null
+}
+
 ensure_rust_toolchain() {
+  # Prefer rustup's cargo over stale system toolchains (e.g. /usr/local/cargo 1.83).
   export PATH="${HOME}/.cargo/bin:/usr/local/cargo/bin:${PATH}"
   export CARGO_HOME="${HOME}/.cargo"
   export RUSTUP_HOME="${HOME}/.rustup"
 
-  if ! command -v rustup >/dev/null 2>&1; then
+  if ! command -v cargo >/dev/null 2>&1 && ! command -v rustup >/dev/null 2>&1; then
     log "installing rustup..."
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
       | sh -s -- -y --default-toolchain stable --profile minimal
@@ -192,20 +198,53 @@ ensure_rust_toolchain() {
   [[ -f "${HOME}/.cargo/env" ]] && . "${HOME}/.cargo/env"
   export PATH="${HOME}/.cargo/bin:${PATH}"
 
-  local min_major=1 min_minor=85
-  local ver major minor
-  ver="$(rustc --version 2>/dev/null | awk '{print $2}')"
-  major="${ver%%.*}"
-  minor="${ver#*.}"
-  minor="${minor%%.*}"
-  if [[ -z "$ver" ]] || [[ "$major" -lt "$min_major" ]] \
-    || { [[ "$major" -eq "$min_major" ]] && [[ "$minor" -lt "$min_minor" ]]; }; then
-    log "ensuring stable Rust >= ${min_major}.${min_minor} (have: ${ver:-none})"
-    rustup toolchain install stable
-    rustup default stable
+  if ! command -v cargo >/dev/null 2>&1; then
+    log "cargo not on PATH (install rustup from https://rustup.rs/)"
+    return 0
   fi
 
-  log "rustc ready ($(rustc --version 2>/dev/null | head -1))"
+  local ver
+  ver="$(cargo --version | awk '{print $2}')"
+  if cargo_version_ok "$ver"; then
+    log "cargo $ver ok"
+    return 0
+  fi
+
+  if command -v rustup >/dev/null 2>&1; then
+    log "cargo $ver too old (need >= 1.85); installing stable via rustup..."
+    rustup toolchain install stable
+    rustup default stable
+    # shellcheck disable=SC1091
+    [[ -f "${HOME}/.cargo/env" ]] && . "${HOME}/.cargo/env"
+    export PATH="${HOME}/.cargo/bin:${PATH}"
+    ver="$(cargo --version | awk '{print $2}')"
+    log "cargo $ver ready"
+    return 0
+  fi
+
+  log "warning: cargo $ver < 1.85 and rustup not found — installing rustup..."
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain stable --profile minimal
+  # shellcheck disable=SC1091
+  . "${HOME}/.cargo/env"
+  export PATH="${HOME}/.cargo/bin:${PATH}"
+  log "cargo $(cargo --version | awk '{print $2}') ready"
+}
+
+ensure_system_egui_libs() {
+  if ldconfig -p 2>/dev/null | grep -qE 'libxkbcommon-x11\.so'; then
+    log "libxkbcommon-x11 present"
+    return 0
+  fi
+
+  if command -v apt-get >/dev/null 2>&1; then
+    log "installing libxkbcommon-x11-0 (required for X11)..."
+    run_root apt-get update -qq
+    run_root apt-get install -y -qq libxkbcommon-x11-0
+    return 0
+  fi
+
+  log "libxkbcommon-x11 missing; nix run will use nixpkgs egui libs (may need newer glibc)"
 }
 
 warm_cargo_deps() {
@@ -278,6 +317,8 @@ install_starship() {
 
 install_determinate_nix
 ensure_vidya_sibling
+ensure_rust_toolchain
+ensure_system_egui_libs
 warm_cargo_deps
 warm_flake
 install_starship
