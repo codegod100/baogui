@@ -1243,15 +1243,20 @@ impl BaoGuiApp {
                     } else {
                         "••••••••"
                     };
-                    let val_resp = ui.add(
-                        egui::Label::new(
-                            RichText::new(shown)
-                                .size(th.type_scale.body)
-                                .monospace()
-                                .color(th.palette.text),
+                    let val_w = ui.available_width();
+                    let val_resp = ui.scope(|ui| {
+                        ui.set_max_width(val_w.max(1.0));
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(shown)
+                                    .size(th.type_scale.body)
+                                    .monospace()
+                                    .color(th.palette.text),
+                            )
+                            .sense(egui::Sense::click())
+                            .truncate(),
                         )
-                        .sense(egui::Sense::click()),
-                    );
+                    }).inner;
                     if val_resp.clicked() {
                         copy_val = Some(hit.value.clone());
                     }
