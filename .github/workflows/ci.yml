@@ -1,5 +1,5 @@
 # CI: host checks (always) + optional nixbuild APK on main / when secrets are set.
-# APK: nix build .#android → baogui.apk
+# APK: nix build .#android → baogui.apk → workflow artifact + summary link.
 #
 # NIXBUILD_TOKEN is fetched from OpenBao (secret/data/ai-api-keys). Falls back to
 # the repository secret nixbuild_token when OPENBAO_TOKEN is unset.
@@ -106,11 +106,26 @@ jobs:
 
       - name: Upload APK
         if: steps.creds.outputs.has_token == 'true'
+        id: upload-apk
         uses: actions/upload-artifact@v4
         with:
           name: baogui-apk
           path: result-android/baogui.apk
           if-no-files-found: error
+
+      - name: APK summary
+        if: steps.creds.outputs.has_token == 'true'
+        run: |
+          version="$(grep '^version' android/Cargo.toml | head -1 | cut -d'"' -f2)"
+          {
+            echo "## APK"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Version | \`$version\` |"
+            echo "| Workflow artifact | [baogui.apk](${{ steps.upload-apk.outputs.artifact-url }}) |"
+            echo "| Commit | \`${{ github.sha }}\` |"
+          } >>"$GITHUB_STEP_SUMMARY"
 
   smoke:
     name: APK smoke (smoke.boxd)
