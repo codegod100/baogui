@@ -1,4 +1,4 @@
-# Build distributable APK on nixbuild.net.
+# CI: host checks (always) + optional nixbuild APK on main / when secrets are set.
 # APK: nix build .#android → baogui.apk
 #
 # NIXBUILD_TOKEN is fetched from OpenBao (secret/data/ai-api-keys). Falls back to
@@ -17,34 +17,77 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  apk:
-    name: APK (android)
+  check:
+    name: Check (host)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      - name: Clone vidya
+        run: git clone --depth 1 https://tangled.org/nandi.uk/vidya ../vidya
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+
+      - name: Install egui system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev \
+            libgl1-mesa-dev libegl1-mesa-dev libvulkan-dev pkg-config
+
+      - name: cargo clippy
+        run: cargo clippy -- -D warnings
+
+      - name: cargo test
+        run: cargo test
+
+  apk:
+    name: APK (android)
+    runs-on: ubuntu-latest
+    outputs:
+      built: ${{ steps.creds.outputs.has_token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: creds
+        env:
+          OPENBAO_TOKEN: ${{ secrets.OPENBAO_TOKEN }}
+          NIXBUILD_TOKEN_FALLBACK: ${{ secrets.nixbuild_token }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${OPENBAO_TOKEN:-}" || -n "${NIXBUILD_TOKEN_FALLBACK:-}" ]]; then
+            echo "has_token=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "has_token=false" >>"$GITHUB_OUTPUT"
+            echo "No nixbuild credentials — skipping APK build" >&2
+            echo "Set OPENBAO_TOKEN (preferred) or nixbuild_token repository secret" >&2
+          fi
+
       - name: Fetch nixbuild token
+        if: steps.creds.outputs.has_token == 'true'
         env:
           OPENBAO_ADDR: https://openbao.boxd.sh
           OPENBAO_TOKEN: ${{ secrets.OPENBAO_TOKEN }}
           OPENBAO_SECRET_PATH: secret/data/ai-api-keys
+          NIXBUILD_TOKEN_FALLBACK: ${{ secrets.nixbuild_token }}
         run: |
           set -euo pipefail
           if [[ -n "${OPENBAO_TOKEN:-}" ]]; then
             chmod +x scripts/fetch-openbao-env.sh
             ./scripts/fetch-openbao-env.sh --github-env --keys NIXBUILD_TOKEN
-          elif [[ -n "${{ secrets.nixbuild_token }}" ]]; then
+          else
             {
               echo "NIXBUILD_TOKEN<<EOF"
-              echo "${{ secrets.nixbuild_token }}"
+              echo "$NIXBUILD_TOKEN_FALLBACK"
               echo "EOF"
             } >>"$GITHUB_ENV"
-          else
-            echo "Set OPENBAO_TOKEN (preferred) or nixbuild_token repository secret" >&2
-            exit 1
           fi
 
       - uses: nixbuild/nix-quick-install-action@v35
+        if: steps.creds.outputs.has_token == 'true'
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
           nix_conf: |
@@ -52,14 +95,17 @@ jobs:
             experimental-features = nix-command flakes
 
       - uses: nixbuild/nixbuild-action@v25
+        if: steps.creds.outputs.has_token == 'true'
         with:
           nixbuild_token: ${{ env.NIXBUILD_TOKEN }}
           generate_summary_for: job
 
       - name: nix build .#android
+        if: steps.creds.outputs.has_token == 'true'
         run: nix build ".#android" -L --print-build-logs --out-link result-android
 
       - name: Upload APK
+        if: steps.creds.outputs.has_token == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: baogui-apk
@@ -70,7 +116,10 @@ jobs:
     name: APK smoke (smoke.boxd)
     needs: [apk]
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    if: >-
+      needs.apk.outputs.built == 'true' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     steps:
       - name: Install boxd CLI
         run: curl -fsSL https://boxd.sh/downloads/install.sh | sh
@@ -113,16 +162,18 @@ jobs:
   ci:
     name: CI
     if: always()
-    needs: [apk, smoke]
+    needs: [check, apk, smoke]
     runs-on: ubuntu-latest
     steps:
-      - name: Require APK build
+      - name: Require checks
         run: |
           set -euo pipefail
+          check="${{ needs.check.result }}"
+          echo "check=$check"
+          [[ "$check" == success ]]
           apk="${{ needs.apk.result }}"
           echo "apk=$apk"
           [[ "$apk" == success ]]
           smoke="${{ needs.smoke.result }}"
           echo "smoke=$smoke"
           [[ "$smoke" == "success" || "$smoke" == "skipped" ]]
-

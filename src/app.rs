@@ -6,10 +6,12 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align, Key, Layout, RichText, ScrollArea, TextEdit, Vec2};
 use vidya::{
-    apply, body, button, card, central_page, data_table_fixed, destructive_button, dim_label,
-    icon_button, measure_body_mono, primary_button, reserve_system_chrome, table_text_sized,
-    text_field_multiline, text_field_singleline, title, title_2, Col, ColKind, Icon, Theme,
+    apply, body, button, card, central_page, data_table, destructive_button, dim_label,
+    icon_button, primary_button, table_text, text_field_multiline, text_field_singleline, title,
+    title_2, Col, ColKind, Icon, Theme,
 };
+#[cfg(target_os = "android")]
+use vidya::reserve_system_chrome;
 
 use crate::api::{Client, SearchIndex, SearchMatch, SecretData};
 
@@ -513,7 +515,6 @@ impl BaoGuiApp {
                     match client.list_secrets(&mount, &full) {
                         Ok(children) if !children.is_empty() => {
                             self.enter_folder(&full);
-                            return;
                         }
                         Ok(_) => self.show_toast(format!("Not found: {full}")),
                         Err(list_err) => {
@@ -1022,12 +1023,12 @@ impl BaoGuiApp {
                 let mut save_clicked = false;
                 let mut add_key = false;
                 let reveal_label = if self.reveal_values {
-                    (Icon::EyeOff, "Hide values")
+                    "Hide values"
                 } else {
-                    (Icon::Eye, "Show values")
+                    "Show values"
                 };
                 ui.horizontal(|ui| {
-                    if icon_button(ui, th, reveal_label.0, reveal_label.1).clicked() {
+                    if button(ui, th, reveal_label).clicked() {
                         reveal_clicked = true;
                     }
                     if button(ui, th, "Add key").clicked() {
@@ -1167,12 +1168,12 @@ impl BaoGuiApp {
                 );
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let (icon, tip) = if self.reveal_values {
-                    (Icon::EyeOff, "Hide values")
+                let label = if self.reveal_values {
+                    "Hide values"
                 } else {
-                    (Icon::Eye, "Show values")
+                    "Show values"
                 };
-                if icon_button(ui, th, icon, tip).clicked() {
+                if button(ui, th, label).clicked() {
                     self.reveal_values = !self.reveal_values;
                 }
             });
@@ -1214,29 +1215,22 @@ impl BaoGuiApp {
 
         let mut open_path: Option<String> = None;
         let mut copy_val: Option<String> = None;
-        let viewport_w = ui.available_width();
-        let col_widths = search_table_col_widths(ui, th, &hits, reveal, viewport_w);
 
         ScrollArea::both()
             .id_salt("search_hits")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                data_table_fixed(ui, th, "search_hits_table", &cols, &col_widths, |ui, i, col_max| {
+                data_table(ui, th, "search_hits_table", &cols, |ui, i| {
                     let hit = &hits[i];
-                    let path_w = col_max.first().copied().unwrap_or(1.0);
-                    let path_resp = ui.scope(|ui| {
-                        ui.set_min_width(path_w);
-                        ui.set_max_width(path_w);
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(&hit.path)
-                                    .size(th.type_scale.body)
-                                    .monospace()
-                                    .color(th.palette.accent),
-                            )
-                            .sense(egui::Sense::click()),
+                    let path_resp = ui.add(
+                        egui::Label::new(
+                            RichText::new(&hit.path)
+                                .size(th.type_scale.body)
+                                .monospace()
+                                .color(th.palette.accent),
                         )
-                    }).inner;
+                        .sense(egui::Sense::click()),
+                    );
                     if path_resp.clicked() {
                         open_path = Some(hit.path.clone());
                     }
@@ -1245,28 +1239,22 @@ impl BaoGuiApp {
                     }
                     path_resp.on_hover_text("Open secret");
 
-                    let key_w = col_max.get(1).copied().unwrap_or(1.0);
-                    table_text_sized(ui, th, &hit.key, true, key_w);
+                    table_text(ui, th, &hit.key, true);
 
                     let shown = if reveal {
                         hit.value.as_str()
                     } else {
                         "••••••••"
                     };
-                    let val_w = col_max.get(2).copied().unwrap_or(1.0);
-                    let val_resp = ui.scope(|ui| {
-                        ui.set_min_width(val_w);
-                        ui.set_max_width(val_w);
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(shown)
-                                    .size(th.type_scale.body)
-                                    .monospace()
-                                    .color(th.palette.text),
-                            )
-                            .sense(egui::Sense::click()),
+                    let val_resp = ui.add(
+                        egui::Label::new(
+                            RichText::new(shown)
+                                .size(th.type_scale.body)
+                                .monospace()
+                                .color(th.palette.text),
                         )
-                    }).inner;
+                        .sense(egui::Sense::click()),
+                    );
                     if val_resp.clicked() {
                         copy_val = Some(hit.value.clone());
                     }
@@ -1405,45 +1393,6 @@ impl BaoGuiApp {
                     });
             });
     }
-}
-
-fn search_table_col_widths(
-    ui: &egui::Ui,
-    th: &Theme,
-    hits: &[SearchHit],
-    reveal: bool,
-    viewport_w: f32,
-) -> [f32; 3] {
-    let pad = th.spacing.md * 2.0;
-    let measure = |s: &str| measure_body_mono(ui, th, s) + pad;
-
-    let path_min = hits
-        .iter()
-        .map(|h| measure(&h.path))
-        .chain([measure("Path")])
-        .fold(120.0_f32, f32::max);
-    let key_min = hits
-        .iter()
-        .map(|h| measure(&h.key))
-        .chain([measure("Key")])
-        .fold(100.0_f32, f32::max);
-    let masked = "••••••••";
-    let val_min = hits
-        .iter()
-        .map(|h| measure(if reveal { h.value.as_str() } else { masked }))
-        .chain([measure("Value")])
-        .fold(160.0_f32, f32::max);
-
-    let gap = th.spacing.md;
-    let content_total = path_min + key_min + val_min + gap * 2.0;
-    let viewport_w = viewport_w.max(1.0);
-    if content_total >= viewport_w {
-        return [path_min, key_min, val_min];
-    }
-
-    let extra = viewport_w - content_total;
-    let share = extra / 3.0;
-    [path_min + share, key_min + share, val_min + share]
 }
 
 fn parse_kv_lines(text: &str) -> BTreeMap<String, String> {
