@@ -186,8 +186,39 @@ warm_flake() {
   nix develop "$ROOT" -c true
 }
 
+ensure_starship_shell_init() {
+  local init_line='eval "$(starship init bash)"'
+  for rc in "${HOME}/.bashrc" "${HOME}/.profile"; do
+    touch "$rc"
+    if ! grep -qF 'starship init bash' "$rc" 2>/dev/null; then
+      {
+        echo ''
+        echo '# starship prompt (installed by .cursor/install.sh)'
+        echo "$init_line"
+      } >>"$rc"
+    fi
+  done
+}
+
+install_starship() {
+  export PATH="${HOME}/.local/bin:${PATH}"
+  if command -v starship >/dev/null 2>&1; then
+    log "starship already installed ($(starship --version 2>&1 | head -1))"
+    ensure_starship_shell_init
+    return 0
+  fi
+
+  log "installing starship..."
+  mkdir -p "${HOME}/.local/bin"
+  curl -fsSL https://starship.rs/install.sh | sh -s -- -y -b "${HOME}/.local/bin"
+  export PATH="${HOME}/.local/bin:${PATH}"
+  ensure_starship_shell_init
+  log "starship ready ($(starship --version 2>&1 | head -1))"
+}
+
 install_determinate_nix
 ensure_vidya_sibling
 warm_flake
+install_starship
 
 log "done"
