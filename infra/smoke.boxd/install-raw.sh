@@ -73,18 +73,33 @@ if [[ ! -d "$SMOKE_HOME/vidya/.git" ]]; then
   sudo -u "$SMOKE_USER" git clone --depth 1 https://tangled.org/nandi.uk/vidya "$SMOKE_HOME/vidya"
 fi
 
-# VNC + noVNC systemd units
+# XFCE session for TigerVNC
+sudo -u "$SMOKE_USER" mkdir -p "$SMOKE_HOME/.vnc"
+cat >"$SMOKE_HOME/.vnc/xstartup" <<'XSTART'
+#!/bin/sh
+unset SESSION_MANAGER
+unset DBUS_SESSION_BUS_ADDRESS
+exec startxfce4
+XSTART
+chmod +x "$SMOKE_HOME/.vnc/xstartup"
+chown "$SMOKE_USER:$SMOKE_USER" "$SMOKE_HOME/.vnc/xstartup"
+printf '%s\n' "$VNC_PASS" | sudo -u "$SMOKE_USER" vncpasswd -f >"$SMOKE_HOME/.vnc/passwd"
+chmod 600 "$SMOKE_HOME/.vnc/passwd"
+chown "$SMOKE_USER:$SMOKE_USER" "$SMOKE_HOME/.vnc/passwd"
+
+# VNC + noVNC systemd units (Type=oneshot: vncserver forks then exits)
 cat >/etc/systemd/system/smoke-vnc.service <<EOF
 [Unit]
 Description=TigerVNC for smoke.boxd
 After=network.target
 
 [Service]
+Type=oneshot
+RemainAfterExit=yes
 User=$SMOKE_USER
 Group=$SMOKE_USER
 WorkingDirectory=$SMOKE_HOME
 Environment=DISPLAY=:1
-ExecStartPre=/bin/bash -c 'mkdir -p \$HOME/.vnc; if [[ ! -f \$HOME/.vnc/passwd ]]; then printf "%s\\n" "$VNC_PASS" | vncpasswd -f > \$HOME/.vnc/passwd; chmod 600 \$HOME/.vnc/passwd; fi'
 ExecStart=/usr/bin/vncserver :1 -geometry 1280x800 -depth 24 -localhost no -SecurityTypes VncAuth
 ExecStop=/usr/bin/vncserver -kill :1
 
