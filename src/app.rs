@@ -5,8 +5,9 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align, Key, Layout, RichText, ScrollArea, TextEdit, Vec2};
 use vidya::{
-    apply, body, button, card, central_page, destructive_button, dim_label, icon_button,
-    primary_button, text_field_multiline, text_field_singleline, title, title_2, Icon, Theme,
+    apply, body, button, card, central_page, data_table, destructive_button, dim_label,
+    icon_button, primary_button, table_text, text_field_multiline, text_field_singleline, title,
+    title_2, Col, ColKind, Icon, Theme,
 };
 
 use crate::api::{Client, SecretData};
@@ -31,6 +32,13 @@ struct NewDialog {
     body: String,
 }
 
+#[derive(Clone)]
+struct SearchHit {
+    path: String,
+    key: String,
+    value: String,
+}
+
 pub struct BaoGuiApp {
     screen: Screen,
 
@@ -51,6 +59,12 @@ pub struct BaoGuiApp {
 
     // Sidebar
     list_keys: Vec<String>,
+    list_filter: String,
+
+    // Search results (mount-wide; Path / Key / Value table)
+    search_hits: Vec<SearchHit>,
+    /// Cache key: `mount\\0filter` for the last computed `search_hits`.
+    search_cache_key: String,
 
     // Detail
     show_detail: bool,
@@ -98,6 +112,9 @@ impl BaoGuiApp {
             folder: String::new(),
             current_path: String::new(),
             list_keys: Vec::new(),
+            list_filter: String::new(),
+            search_hits: Vec::new(),
+            search_cache_key: String::new(),
             show_detail: false,
             path_display: String::new(),
             meta: String::new(),
@@ -208,6 +225,9 @@ impl BaoGuiApp {
         self.folder.clear();
         self.current_path.clear();
         self.list_keys.clear();
+        self.list_filter.clear();
+        self.search_hits.clear();
+        self.search_cache_key.clear();
         self.kv_rows.clear();
         self.show_detail = false;
         self.new_dialog = None;
@@ -237,6 +257,85 @@ impl BaoGuiApp {
                 self.show_toast(format!("List failed: {e}"));
             }
         }
+        self.search_cache_key.clear();
+    }
+
+    /// Scan every secret under the mount for path / key / value matches.
+    fn ensure_search_hits(&mut self) {
+        let filter = self.list_filter.trim().to_lowercase();
+        if filter.is_empty() {
+            self.search_hits.clear();
+            self.search_cache_key.clear();
+            return;
+        }
+        let cache_key = format!("{}\0{filter}", self.mount);
+        if self.search_cache_key == cache_key {
+            return;
+        }
+
+        self.search_hits.clear();
+        let Some(client) = self.client.clone() else {
+            self.search_cache_key = cache_key;
+            return;
+        };
+        let mount = self.mount.clone();
+
+        let paths = match client.list_all_secret_paths(&mount) {
+            Ok(p) => p,
+            Err(e) => {
+                self.show_toast(format!("Search failed: {e}"));
+                self.search_cache_key = cache_key;
+                return;
+            }
+        };
+
+        for full in paths {
+            let path_match = full.to_lowercase().contains(&filter);
+            let secret = match client.read_secret(&mount, &full) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            for (k, v) in &secret.data {
+                let key_match = k.to_lowercase().contains(&filter);
+                let val_match = v.to_lowercase().contains(&filter);
+                if path_match || key_match || val_match {
+                    self.search_hits.push(SearchHit {
+                        path: full.clone(),
+                        key: k.clone(),
+                        value: v.clone(),
+                    });
+                }
+            }
+        }
+        self.search_hits
+            .sort_by(|a, b| (&a.path, &a.key).cmp(&(&b.path, &b.key)));
+        self.search_cache_key = cache_key;
+    }
+
+    /// Open a secret by full mount-relative path (navigates folder + loads detail).
+    fn open_secret_at_path(&mut self, path: &str) {
+        let path = path.trim_matches('/');
+        if path.is_empty() {
+            return;
+        }
+        if let Some(idx) = path.rfind('/') {
+            self.folder = path[..idx].to_string();
+        } else {
+            self.folder.clear();
+        }
+        self.list_filter.clear();
+        self.search_hits.clear();
+        self.search_cache_key.clear();
+        self.refresh_list();
+
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let mount = self.mount.clone();
+        match client.read_secret(&mount, path) {
+            Ok(secret) => self.apply_secret(path, &secret),
+            Err(e) => self.show_toast(format!("Read failed: {e}")),
+        }
     }
 
     fn go_up(&mut self) {
@@ -249,6 +348,7 @@ impl BaoGuiApp {
             self.folder.clear();
         }
         self.current_path.clear();
+        self.list_filter.clear();
         self.show_detail = false;
         self.refresh_list();
     }
@@ -264,6 +364,7 @@ impl BaoGuiApp {
             self.folder = format!("{}/{}", self.folder, folder_name);
         }
         self.current_path.clear();
+        self.list_filter.clear();
         self.show_detail = false;
         self.refresh_list();
     }
@@ -605,6 +706,29 @@ impl BaoGuiApp {
                 }
             });
 
+        // Global search before panels so the table + sidebar share one hit list.
+        if !self.list_filter.trim().is_empty() {
+            self.ensure_search_hits();
+        } else {
+            self.search_hits.clear();
+            self.search_cache_key.clear();
+        }
+
+        let filter = self.list_filter.trim().to_lowercase();
+        let searching = !filter.is_empty();
+        let visible: Vec<String> = if searching {
+            let mut paths: Vec<String> = self
+                .search_hits
+                .iter()
+                .map(|h| h.path.clone())
+                .collect();
+            paths.sort();
+            paths.dedup();
+            paths
+        } else {
+            self.list_keys.clone()
+        };
+
         egui::SidePanel::left("sidebar")
             .resizable(true)
             .default_width(SIDEBAR_W)
@@ -622,7 +746,7 @@ impl BaoGuiApp {
                 ui.horizontal(|ui| {
                     dim_label(ui, th, &format!("Mount: {}/", self.mount));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.add_enabled_ui(!self.folder.is_empty(), |ui| {
+                        ui.add_enabled_ui(!self.folder.is_empty() && !searching, |ui| {
                             if button(ui, th, "Up").clicked() {
                                 self.go_up();
                             }
@@ -631,27 +755,75 @@ impl BaoGuiApp {
                 });
                 ui.add_space(th.spacing.xs);
                 ui.label(
-                    RichText::new(self.breadcrumb())
-                        .size(th.type_scale.title_2)
-                        .strong()
-                        .color(th.palette.text)
-                        .monospace(),
+                    RichText::new(if searching {
+                        "Search".to_string()
+                    } else {
+                        self.breadcrumb()
+                    })
+                    .size(th.type_scale.title_2)
+                    .strong()
+                    .color(th.palette.text)
+                    .monospace(),
                 );
                 ui.add_space(th.spacing.sm);
                 ui.separator();
+                ui.add_space(th.spacing.xs);
+
+                let sw = ui.available_width().max(1.0);
+                ui.add(
+                    TextEdit::singleline(&mut self.list_filter)
+                        .hint_text("Search all secrets…")
+                        .margin(th.text_edit_margin())
+                        .desired_width(sw)
+                        .min_size(Vec2::new(0.0, th.spacing.control_height)),
+                );
                 ui.add_space(th.spacing.xs);
 
                 ScrollArea::vertical()
                     .id_salt("sidebar_list")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
+                        if searching {
+                            if visible.is_empty() {
+                                dim_label(ui, th, "(no matches)");
+                                return;
+                            }
+                            let mut clicked: Option<String> = None;
+                            for path in &visible {
+                                let selected = self.current_path == *path;
+                                let row_w = ui.available_width().max(1.0);
+                                let resp = ui.add_sized(
+                                    [row_w, th.spacing.control_height],
+                                    egui::SelectableLabel::new(
+                                        selected,
+                                        RichText::new(path)
+                                            .size(th.type_scale.body)
+                                            .monospace()
+                                            .color(if selected {
+                                                th.palette.accent
+                                            } else {
+                                                th.palette.text
+                                            }),
+                                    ),
+                                );
+                                if resp.clicked() {
+                                    clicked = Some(path.clone());
+                                }
+                            }
+                            if let Some(path) = clicked {
+                                self.open_secret_at_path(&path);
+                                ui.ctx().request_repaint();
+                            }
+                            return;
+                        }
+
                         if self.list_keys.is_empty() {
                             dim_label(ui, th, "(empty)");
                             return;
                         }
 
                         let mut clicked: Option<String> = None;
-                        for key in &self.list_keys {
+                        for key in &visible {
                             let is_folder = key.ends_with('/');
                             let display = key.trim_end_matches('/').to_string();
                             let selected = !is_folder
@@ -690,9 +862,16 @@ impl BaoGuiApp {
                     });
             });
 
+        let searching = !self.list_filter.trim().is_empty();
+
         egui::CentralPanel::default()
             .frame(th.page_frame())
             .show(ctx, |ui| {
+                if searching {
+                    self.ui_search_results(ui, ctx, th);
+                    return;
+                }
+
                 if !self.show_detail {
                     ui.vertical_centered(|ui| {
                         ui.add_space(ui.available_height() * 0.28);
@@ -861,6 +1040,118 @@ impl BaoGuiApp {
                     self.show_toast("Value copied");
                 }
             });
+    }
+
+    fn ui_search_results(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, th: &Theme) {
+        let n = self.search_hits.len();
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                title_2(ui, th, "Search results");
+                dim_label(
+                    ui,
+                    th,
+                    &format!(
+                        "{n} matching key/value pair{} across {}/",
+                        if n == 1 { "" } else { "s" },
+                        self.mount
+                    ),
+                );
+            });
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let reveal_label = if self.reveal_values {
+                    "Hide values"
+                } else {
+                    "Show values"
+                };
+                if button(ui, th, reveal_label).clicked() {
+                    self.reveal_values = !self.reveal_values;
+                }
+            });
+        });
+
+        ui.add_space(th.spacing.md);
+        ui.separator();
+        ui.add_space(th.spacing.sm);
+
+        if n == 0 {
+            dim_label(ui, th, "No matching keys or values in this mount.");
+            return;
+        }
+
+        let hits = self.search_hits.clone();
+        let reveal = self.reveal_values;
+        let cols = [
+            Col {
+                header: "Path",
+                kind: ColKind::Flex,
+            },
+            Col {
+                header: "Key",
+                kind: ColKind::Flex,
+            },
+            Col {
+                header: "Value",
+                kind: ColKind::Flex,
+            },
+        ];
+
+        let mut open_path: Option<String> = None;
+        let mut copy_val: Option<String> = None;
+
+        ScrollArea::vertical()
+            .id_salt("search_hits")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                data_table(ui, th, "search_hits_table", &cols, |ui, i| {
+                    let hit = &hits[i];
+                    let path_resp = ui.add(
+                        egui::Label::new(
+                            RichText::new(&hit.path)
+                                .size(th.type_scale.body)
+                                .monospace()
+                                .color(th.palette.accent),
+                        )
+                        .sense(egui::Sense::click()),
+                    );
+                    if path_resp.clicked() {
+                        open_path = Some(hit.path.clone());
+                    }
+                    if path_resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    path_resp.on_hover_text("Open secret");
+
+                    table_text(ui, th, &hit.key, true);
+
+                    let shown = if reveal {
+                        hit.value.as_str()
+                    } else {
+                        "••••••••"
+                    };
+                    let val_resp = ui.add(
+                        egui::Label::new(
+                            RichText::new(shown)
+                                .size(th.type_scale.body)
+                                .monospace()
+                                .color(th.palette.text),
+                        )
+                        .sense(egui::Sense::click()),
+                    );
+                    if val_resp.clicked() {
+                        copy_val = Some(hit.value.clone());
+                    }
+                    val_resp.on_hover_text("Copy value");
+                }, n);
+            });
+
+        if let Some(path) = open_path {
+            self.open_secret_at_path(&path);
+            ctx.request_repaint();
+        }
+        if let Some(v) = copy_val {
+            ctx.copy_text(v);
+            self.show_toast("Value copied");
+        }
     }
 
     fn ui_modals(&mut self, ctx: &egui::Context, th: &Theme) {
