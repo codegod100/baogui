@@ -144,6 +144,19 @@
           androidSdk = androidComposition.androidsdk;
           androidSdkRoot = "${androidSdk}/libexec/android-sdk";
 
+          # Emulator + x86_64 system image (KVM-accelerated APK runs).
+          androidCompositionEmu = pkgs.androidenv.composeAndroidPackages {
+            platformVersions = [ "34" ];
+            buildToolsVersions = [ "34.0.0" ];
+            includeNDK = true;
+            includeEmulator = true;
+            includeSystemImages = true;
+            systemImageTypes = [ "google_apis" ];
+            abiVersions = [ "x86_64" ];
+          };
+          androidSdkEmu = androidCompositionEmu.androidsdk;
+          androidSdkEmuRoot = "${androidSdkEmu}/libexec/android-sdk";
+
           baogui = pkgs.rustPlatform.buildRustPackage {
             pname = "baogui";
             version = "0.1.0";
@@ -365,6 +378,67 @@ PY
             name = "waydroid-release";
             release = true;
           };
+
+          mkEmulatorApp = pkgs.writeShellApplication {
+            name = "emulator";
+            runtimeInputs = [
+              rustAndroid
+              pkgs.cargo-apk
+              androidSdkEmu
+              pkgs.jdk17_headless
+              pkgs.python3
+              pkgs.coreutils
+              pkgs.bash
+            ];
+            text = ''
+              set -euo pipefail
+              export ANDROID_HOME="''${ANDROID_HOME:-${androidSdkEmuRoot}}"
+              export ANDROID_SDK_ROOT="''${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+              export ANDROID_NDK_HOME="''${ANDROID_NDK_HOME:-${androidSdkRoot}/ndk-bundle}"
+              export ANDROID_NDK_ROOT="''${ANDROID_NDK_ROOT:-$ANDROID_NDK_HOME}"
+              export PATH="$ANDROID_HOME/emulator:$ANDROID_HOME/platform-tools:$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
+              script=""
+              if [[ -f ./scripts/emulator.sh ]]; then
+                script=./scripts/emulator.sh
+              else
+                script="${./scripts/emulator.sh}"
+              fi
+              exec bash "$script" "$@"
+            '';
+          };
+
+          run-emulator = mkEmulatorApp;
+
+          mkRunApkApp = pkgs.writeShellApplication {
+            name = "run-apk";
+            runtimeInputs = [
+              rustAndroid
+              pkgs.cargo-apk
+              androidSdkEmu
+              pkgs.jdk17_headless
+              pkgs.python3
+              pkgs.coreutils
+              pkgs.bash
+              pkgs.android-tools
+            ];
+            text = ''
+              set -euo pipefail
+              export ANDROID_HOME="''${ANDROID_HOME:-${androidSdkEmuRoot}}"
+              export ANDROID_SDK_ROOT="''${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+              export ANDROID_NDK_HOME="''${ANDROID_NDK_HOME:-${androidSdkRoot}/ndk-bundle}"
+              export ANDROID_NDK_ROOT="''${ANDROID_NDK_ROOT:-$ANDROID_NDK_HOME}"
+              export PATH="$ANDROID_HOME/emulator:$ANDROID_HOME/platform-tools:$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
+              script=""
+              if [[ -f ./scripts/run-apk.sh ]]; then
+                script=./scripts/run-apk.sh
+              else
+                script="${./scripts/run-apk.sh}"
+              fi
+              exec bash "$script" "$@"
+            '';
+          };
+
+          run-apk = mkRunApkApp;
         in
         {
           default = baogui;
@@ -375,6 +449,9 @@ PY
           inherit run-waydroid;
           waydroid-release = run-waydroid-release;
           inherit run-waydroid-release;
+          emulator = run-emulator;
+          inherit run-emulator;
+          inherit run-apk;
         }
       );
 
@@ -476,6 +553,14 @@ PY
             type = "app";
             program = "${self.packages.${system}.waydroid-release}/bin/waydroid-release";
           };
+          emulator = {
+            type = "app";
+            program = "${self.packages.${system}.emulator}/bin/emulator";
+          };
+          run-apk = {
+            type = "app";
+            program = "${self.packages.${system}.run-apk}/bin/run-apk";
+          };
         }
       );
 
@@ -503,6 +588,8 @@ PY
               echo "  nix build .#baogui           # pure package (+ installed .desktop)"
               echo "  nix build .#android          # pure APK (aarch64, CI)"
               echo "  nix run .#waydroid           # cargo-apk x86_64 → Waydroid"
+              echo "  nix run .#run-apk            # auto: waydroid | KVM emulator | desktop"
+              echo "  nix run .#emulator           # KVM emulator (needs /dev/kvm)"
             '';
           };
         }
