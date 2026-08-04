@@ -174,7 +174,16 @@ ensure_vidya_sibling() {
     run_root mkdir -p "$parent"
     run_root chown "$(id -u):$(id -g)" "$parent"
   fi
-  git clone --depth 1 "$VIDYA_URL" "$VIDYA_DIR"
+  git clone --depth 1 -b main "$VIDYA_URL" "$VIDYA_DIR"
+}
+
+warm_cargo_deps() {
+  if ! command -v cargo >/dev/null 2>&1; then
+    log "skipping cargo fetch (cargo not on PATH)"
+    return 0
+  fi
+  log "fetching cargo dependencies..."
+  cargo fetch
 }
 
 warm_flake() {
@@ -188,6 +197,7 @@ warm_flake() {
 
 install_determinate_nix
 ensure_vidya_sibling
+warm_cargo_deps
 warm_flake
 
 log "done"
