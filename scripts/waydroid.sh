@@ -280,24 +280,42 @@ launch_app() {
 
 usage() {
   cat <<EOF
-usage: $0 [--release] [build|install|launch|run]
+usage: $0 [--release] [build|install|install-apk|launch|run]
   run (default)  build + install + launch
+  install-apk PATH  install an existing APK (no rebuild)
 EOF
 }
 
 cmd=run
+extra=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h | --help) usage; exit 0 ;;
     --release) RELEASE=1; shift ;;
-    build | install | launch | run) cmd="$1"; shift ;;
-    *) echo "unknown: $1" >&2; usage; exit 1 ;;
+    build | install | install-apk | launch | run) cmd="$1"; shift ;;
+    *)
+      if [[ "$cmd" == "install-apk" && -z "$extra" ]]; then
+        extra="$1"
+        shift
+      else
+        echo "unknown: $1" >&2
+        usage
+        exit 1
+      fi
+      ;;
   esac
 done
 
 case "$cmd" in
   build) build_apk ;;
   install) install_apk "$(build_apk)" ;;
+  install-apk)
+    [[ -n "$extra" && -f "$extra" ]] || {
+      echo "usage: $0 install-apk PATH.apk" >&2
+      exit 1
+    }
+    install_apk "$extra"
+    ;;
   launch) launch_app ;;
   run)
     apk="$(build_apk)"

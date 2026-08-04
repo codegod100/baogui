@@ -130,13 +130,18 @@ cmd="${1:-run}"
 shift || true
 case "$cmd" in
   build) build_apk ;;
+  install)
+    apk="${1:-}"
+    [[ -n "$apk" && -f "$apk" ]] || { echo "usage: $0 install PATH.apk" >&2; exit 1; }
+    install_and_launch "$apk"
+    ;;
   run)
     apk="$(build_apk)"
     install_and_launch "$apk"
     echo "$apk"
     ;;
   *)
-    echo "usage: $0 [build|run]" >&2
+    echo "usage: $0 [build|install PATH|run]" >&2
     exit 1
     ;;
 esac

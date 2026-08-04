@@ -66,10 +66,53 @@ jobs:
           path: result-android/baogui.apk
           if-no-files-found: error
 
+  smoke:
+    name: APK smoke (smoke.boxd)
+    needs: [apk]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    steps:
+      - name: Fetch smoke SSH key
+        env:
+          OPENBAO_ADDR: https://openbao.boxd.sh
+          OPENBAO_TOKEN: ${{ secrets.OPENBAO_TOKEN }}
+          OPENBAO_SECRET_PATH: secret/data/ai-api-keys
+        run: |
+          set -euo pipefail
+          if [[ -z "${OPENBAO_TOKEN:-}" ]]; then
+            echo "OPENBAO_TOKEN unset — skip remote smoke (provision smoke.boxd + secret first)" >&2
+            exit 0
+          fi
+          chmod +x scripts/fetch-openbao-env.sh
+          ./scripts/fetch-openbao-env.sh --github-env --keys SMOKE_SSH_KEY,SMOKE_HOST || {
+            echo "SMOKE_SSH_KEY not in OpenBao — skip remote smoke" >&2
+            exit 0
+          }
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: baogui-apk
+          path: artifact
+
+      - name: Remote smoke on smoke.boxd
+        if: env.SMOKE_SSH_KEY != ''
+        env:
+          SMOKE_HOST: ${{ env.SMOKE_HOST || 'smoke.boxd.sh' }}
+          SMOKE_USER: smoke
+        run: |
+          set -euo pipefail
+          install -m 600 /dev/stdin ~/.ssh/id_smoke <<<"$SMOKE_SSH_KEY"
+          apk="$(find artifact -name '*.apk' | head -1)"
+          [[ -f "$apk" ]]
+          scp -i ~/.ssh/id_smoke -o StrictHostKeyChecking=accept-new "$apk" \
+            "$SMOKE_USER@$SMOKE_HOST:~/baogui-smoke.apk"
+          ssh -i ~/.ssh/id_smoke "$SMOKE_USER@$SMOKE_HOST" \
+            'cd ~/baogui && git pull --ff-only && ./scripts/apk-smoke.sh --ci ~/baogui-smoke.apk'
+
   ci:
     name: CI
     if: always()
-    needs: [apk]
+    needs: [apk, smoke]
     runs-on: ubuntu-latest
     steps:
       - name: Require APK build
@@ -78,3 +121,7 @@ jobs:
           apk="${{ needs.apk.result }}"
           echo "apk=$apk"
           [[ "$apk" == success ]]
+          smoke="${{ needs.smoke.result }}"
+          echo "smoke=$smoke"
+          [[ "$smoke" == "success" || "$smoke" == "skipped" ]]
+
