@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Align, Key, Layout, RichText, ScrollArea, TextEdit, Vec2};
 use vidya::{
     apply, body, button, card, central_page, data_table, destructive_button, dim_label,
-    icon_button, primary_button, table_text, text_field_multiline, text_field_singleline, title,
+    icon_button, primary_button, table_text, table_text_capped, text_field_multiline, text_field_singleline, title,
     title_2, Col, ColKind, Icon, Theme,
 };
 
@@ -1217,17 +1217,23 @@ impl BaoGuiApp {
             .id_salt("search_hits")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                data_table(ui, th, "search_hits_table", &cols, |ui, i| {
+                data_table(ui, th, "search_hits_table", &cols, |ui, i, col_max| {
                     let hit = &hits[i];
-                    let path_resp = ui.add(
-                        egui::Label::new(
-                            RichText::new(&hit.path)
-                                .size(th.type_scale.body)
-                                .monospace()
-                                .color(th.palette.accent),
+                    let path_w = col_max.first().copied().unwrap_or(1.0);
+                    let path_resp = ui.scope(|ui| {
+                        ui.set_min_width(path_w);
+                        ui.set_max_width(path_w);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&hit.path)
+                                    .size(th.type_scale.body)
+                                    .monospace()
+                                    .color(th.palette.accent),
+                            )
+                            .sense(egui::Sense::click())
+                            .truncate(),
                         )
-                        .sense(egui::Sense::click()),
-                    );
+                    }).inner;
                     if path_resp.clicked() {
                         open_path = Some(hit.path.clone());
                     }
@@ -1236,16 +1242,18 @@ impl BaoGuiApp {
                     }
                     path_resp.on_hover_text("Open secret");
 
-                    table_text(ui, th, &hit.key, true);
+                    let key_w = col_max.get(1).copied().unwrap_or(1.0);
+                    table_text_capped(ui, th, &hit.key, true, key_w);
 
                     let shown = if reveal {
                         hit.value.as_str()
                     } else {
                         "••••••••"
                     };
-                    let val_w = ui.available_width();
+                    let val_w = col_max.get(2).copied().unwrap_or(1.0);
                     let val_resp = ui.scope(|ui| {
-                        ui.set_max_width(val_w.max(1.0));
+                        ui.set_min_width(val_w);
+                        ui.set_max_width(val_w);
                         ui.add(
                             egui::Label::new(
                                 RichText::new(shown)
