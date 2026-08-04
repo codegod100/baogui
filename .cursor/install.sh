@@ -177,6 +177,52 @@ ensure_vidya_sibling() {
   git clone --depth 1 -b main "$VIDYA_URL" "$VIDYA_DIR"
 }
 
+cargo_version_ok() {
+  local ver="${1:?}"
+  printf '%s\n%s\n' "1.85.0" "$ver" | sort -CV 2>/dev/null
+}
+
+ensure_rust_toolchain() {
+  if ! command -v cargo >/dev/null 2>&1; then
+    log "cargo not on PATH (install rustup from https://rustup.rs/)"
+    return 0
+  fi
+
+  local ver
+  ver="$(cargo --version | awk '{print $2}')"
+  if cargo_version_ok "$ver"; then
+    log "cargo $ver ok"
+    return 0
+  fi
+
+  if command -v rustup >/dev/null 2>&1; then
+    log "cargo $ver too old (need >= 1.85); installing stable via rustup..."
+    rustup toolchain install stable
+    rustup default stable
+    ver="$(cargo --version | awk '{print $2}')"
+    log "cargo $ver ready"
+    return 0
+  fi
+
+  log "warning: cargo $ver < 1.85 and rustup not found"
+}
+
+ensure_system_egui_libs() {
+  if ldconfig -p 2>/dev/null | grep -qE 'libxkbcommon-x11\.so'; then
+    log "libxkbcommon-x11 present"
+    return 0
+  fi
+
+  if command -v apt-get >/dev/null 2>&1; then
+    log "installing libxkbcommon-x11-0 (required for X11)..."
+    run_root apt-get update -qq
+    run_root apt-get install -y -qq libxkbcommon-x11-0
+    return 0
+  fi
+
+  log "libxkbcommon-x11 missing; nix run will use nixpkgs egui libs (may need newer glibc)"
+}
+
 warm_cargo_deps() {
   if ! command -v cargo >/dev/null 2>&1; then
     log "skipping cargo fetch (cargo not on PATH)"
@@ -246,6 +292,8 @@ install_starship() {
 
 install_determinate_nix
 ensure_vidya_sibling
+ensure_rust_toolchain
+ensure_system_egui_libs
 warm_cargo_deps
 warm_flake
 install_starship

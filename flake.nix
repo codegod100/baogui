@@ -38,10 +38,26 @@
           libxrandr
         ];
 
+      # Host glibc is often older than nixpkgs libs; prefer system egui deps when present.
+      preferSystemEguiLibs = ''
+        system_egui_libs_ok() {
+          ldconfig -p 2>/dev/null | grep -qE 'libxkbcommon-x11\.so' &&
+            ldconfig -p 2>/dev/null | grep -qE 'libGL\.so\.1' &&
+            ldconfig -p 2>/dev/null | grep -qE 'libwayland-client\.so'
+        }
+      '';
+
+      linkEguiLibs = libPath: ''
+        ${preferSystemEguiLibs}
+        if ! system_egui_libs_ok; then
+          export LD_LIBRARY_PATH="${libPath}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+        fi
+      '';
+
       # Shared by apps.build / apps.baogui: enter checkout + set link path.
       cargoPreamble = libPath: ''
         set -euo pipefail
-        export LD_LIBRARY_PATH="${libPath}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+        ${linkEguiLibs libPath}
 
         if [ ! -f Cargo.toml ] && [ -f "''${FLAKE_ROOT:-}/Cargo.toml" ]; then
           cd "$FLAKE_ROOT"
@@ -133,6 +149,18 @@
             if ! command -v cargo >/dev/null; then
               echo "baogui: cargo not on PATH (install rustup, or: nix develop)" >&2
               exit 1
+            fi
+            cargo_ver=$(cargo --version | awk '{print $2}')
+            if ! printf '%s\n%s\n' "1.85.0" "$cargo_ver" | sort -CV 2>/dev/null; then
+              if command -v rustup >/dev/null; then
+                echo "→ cargo $cargo_ver too old (need >= 1.85); installing stable via rustup..." >&2
+                rustup toolchain install stable
+                rustup default stable
+              else
+                echo "baogui: cargo $cargo_ver is too old (need >= 1.85 for edition2024)" >&2
+                echo "  install rustup: https://rustup.rs/" >&2
+                exit 1
+              fi
             fi
           '';
 
@@ -238,6 +266,10 @@
             LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath libs;
             RUST_BACKTRACE = "1";
             shellHook = ''
+              ${preferSystemEguiLibs}
+              if system_egui_libs_ok; then
+                unset LD_LIBRARY_PATH
+              fi
               echo "BaoGUI dev shell (uses PATH rustc/cargo — not nixpkgs rustc)"
               echo "  nix run / nix run .#baogui   # cargo run (+ staged .desktop/icons)"
               echo "  nix run .#build              # cargo build"
