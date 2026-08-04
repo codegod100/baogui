@@ -186,8 +186,58 @@ warm_flake() {
   nix develop "$ROOT" -c true
 }
 
+remove_starship_shell_init() {
+  local file="$1"
+  [[ -f "$file" ]] || return 0
+  local tmp
+  tmp="$(mktemp)"
+  awk '
+    /^# starship prompt \(installed by \.cursor\/install\.sh\)$/ { skip=1; next }
+    skip && /^eval "\$\(starship init bash\)"$/ { skip=0; next }
+    skip { next }
+    { print }
+  ' "$file" >"$tmp"
+  mv "$tmp" "$file"
+}
+
+ensure_starship_shell_init() {
+  local marker='# starship prompt (installed by .cursor/install.sh)'
+  local path_line='export PATH="$HOME/.local/bin:$PATH"'
+  local init_line='eval "$(starship init bash)"'
+  local rc="${HOME}/.bashrc"
+
+  # Starship lives in ~/.local/bin; only .bashrc is sourced by non-login shells.
+  # Ubuntu .profile sources .bashrc before adding ~/.local/bin, so init belongs in bashrc.
+  remove_starship_shell_init "${HOME}/.profile"
+  remove_starship_shell_init "$rc"
+
+  {
+    echo ''
+    echo "$marker"
+    echo "$path_line"
+    echo "$init_line"
+  } >>"$rc"
+}
+
+install_starship() {
+  export PATH="${HOME}/.local/bin:${PATH}"
+  if command -v starship >/dev/null 2>&1; then
+    log "starship already installed ($(starship --version 2>&1 | head -1))"
+    ensure_starship_shell_init
+    return 0
+  fi
+
+  log "installing starship..."
+  mkdir -p "${HOME}/.local/bin"
+  curl -fsSL https://starship.rs/install.sh | sh -s -- -y -b "${HOME}/.local/bin"
+  export PATH="${HOME}/.local/bin:${PATH}"
+  ensure_starship_shell_init
+  log "starship ready ($(starship --version 2>&1 | head -1))"
+}
+
 install_determinate_nix
 ensure_vidya_sibling
 warm_flake
+install_starship
 
 log "done"
