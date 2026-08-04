@@ -1,5 +1,5 @@
 # CI: host checks (always) + optional nixbuild APK on main / when secrets are set.
-# APK: nix build .#android → baogui.apk → artifact + GitHub Release on main.
+# APK: nix build .#android → baogui.apk → workflow artifact + summary link.
 #
 # NIXBUILD_TOKEN is fetched from OpenBao (secret/data/ai-api-keys). Falls back to
 # the repository secret nixbuild_token when OPENBAO_TOKEN is unset.
@@ -174,59 +174,10 @@ jobs:
           boxd machine exec "$BOXD_SMOKE_NAME" -- bash -lc \
             'cd /opt/baogui && git pull --ff-only && ./scripts/apk-smoke.sh --ci /tmp/smoke/baogui.apk'
 
-  publish:
-    name: Publish APK
-    needs: [apk, smoke]
-    runs-on: ubuntu-latest
-    if: >-
-      needs.apk.outputs.built == 'true' &&
-      (needs.smoke.result == 'success' || needs.smoke.result == 'skipped') &&
-      (github.event_name == 'workflow_dispatch' ||
-       (github.event_name == 'push' && github.ref == 'refs/heads/main'))
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: baogui-apk
-          path: artifact
-
-      - name: Prepare release asset
-        id: asset
-        run: |
-          set -euo pipefail
-          version="$(grep '^version' android/Cargo.toml | head -1 | cut -d'"' -f2)"
-          apk="$(find artifact -name '*.apk' | head -1)"
-          [[ -f "$apk" ]]
-          asset="baogui-${version}-${{ github.run_number }}.apk"
-          cp "$apk" "$asset"
-          echo "version=$version" >>"$GITHUB_OUTPUT"
-          echo "asset=$asset" >>"$GITHUB_OUTPUT"
-
-      - name: Publish GitHub Release
-        id: release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: apk-${{ steps.asset.outputs.version }}-build${{ github.run_number }}
-          name: BaoGUI APK ${{ steps.asset.outputs.version }} (build ${{ github.run_number }})
-          prerelease: true
-          generate_release_notes: true
-          files: ${{ steps.asset.outputs.asset }}
-
-      - name: Release summary
-        run: |
-          {
-            echo "## Published APK"
-            echo ""
-            echo "Download from the [GitHub Release](${{ steps.release.outputs.url }})."
-          } >>"$GITHUB_STEP_SUMMARY"
-
   ci:
     name: CI
     if: always()
-    needs: [check, apk, smoke, publish]
+    needs: [check, apk, smoke]
     runs-on: ubuntu-latest
     steps:
       - name: Require checks
@@ -241,6 +192,3 @@ jobs:
           smoke="${{ needs.smoke.result }}"
           echo "smoke=$smoke"
           [[ "$smoke" == "success" || "$smoke" == "skipped" ]]
-          publish="${{ needs.publish.result }}"
-          echo "publish=$publish"
-          [[ "$publish" == "success" || "$publish" == "skipped" ]]
