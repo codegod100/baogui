@@ -1,9 +1,6 @@
 //! BaoGUI — Vidya / egui OpenBao (Vault-compatible KV) client.
 
-mod api;
-mod app;
-
-use app::BaoGuiApp;
+use baogui::app::BaoGuiApp;
 
 /// FreeDesktop app id — must match `org.openbao.baogui.desktop` (basename).
 /// Wayland compositors use this to pick the icon / group the window.

@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Align, Key, Layout, RichText, ScrollArea, TextEdit, Vec2};
 use vidya::{
     apply, body, button, card, central_page, data_table, destructive_button, dim_label,
-    icon_button, primary_button, table_text, text_field_multiline, text_field_singleline, title,
-    title_2, Col, ColKind, Icon, Theme,
+    icon_button, primary_button, reserve_system_chrome, table_text, text_field_multiline,
+    text_field_singleline, title, title_2, Col, ColKind, Icon, Theme,
 };
 
 use crate::api::{Client, SecretData};
@@ -549,6 +549,8 @@ impl BaoGuiApp {
 impl eframe::App for BaoGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let th = self.theme();
+        #[cfg(target_os = "android")]
+        reserve_system_chrome(ctx, &th);
         apply(ctx, &th);
 
         // Auto-connect once with stored token before painting Connect UI.

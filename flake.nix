@@ -3,6 +3,10 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
     vidya = {
       url = "git+https://tangled.org/nandi.uk/vidya";
       flake = false;
@@ -13,6 +17,7 @@
     {
       self,
       nixpkgs,
+      rust-overlay,
       vidya,
     }:
     let
@@ -21,6 +26,17 @@
         "aarch64-linux"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
+
+      pkgsFor =
+        system:
+        import nixpkgs {
+          inherit system;
+          overlays = [ (import rust-overlay) ];
+          config = {
+            allowUnfree = true;
+            android_sdk.accept_license = true;
+          };
+        };
 
       eguiLibs =
         pkgs:
@@ -37,6 +53,43 @@
           libxi
           libxrandr
         ];
+
+      androidApiLevel = "28";
+      androidTarget = "aarch64-linux-android";
+
+      baoguiSrcTree =
+        pkgs:
+        let
+          baoguiFiltered = pkgs.lib.cleanSourceWith {
+            src = ./.;
+            filter =
+              path: type:
+              let
+                base = baseNameOf path;
+              in
+              pkgs.lib.cleanSourceFilter path type
+              && !(builtins.elem base [
+                ".tangled"
+                ".github"
+                ".cursor"
+                ".jj"
+                ".cargo"
+                "AGENTS.md"
+                "result"
+                "result-android"
+                "result-baogui"
+              ]);
+          };
+        in
+        pkgs.runCommand "baogui-src-tree" { } ''
+          mkdir -p $out/baogui $out/vidya
+          cp -a ${baoguiFiltered}/. $out/baogui/
+          cp -a ${vidya}/. $out/vidya/
+          chmod -R u+w $out
+          rm -rf $out/baogui/{target,result,result-*,.git} 2>/dev/null || true
+          rm -rf $out/baogui/android/target 2>/dev/null || true
+          rm -rf $out/vidya/{target,android-demo,host,examples,docs,.git} 2>/dev/null || true
+        '';
 
       # Shared by apps.build / apps.baogui: enter checkout + set link path.
       cargoPreamble = libPath: ''
@@ -64,26 +117,35 @@
       packages = forAllSystems (
         system:
         let
-          pkgs = nixpkgs.legacyPackages.${system};
+          pkgs = pkgsFor system;
           inherit (pkgs) lib;
           libs = eguiLibs pkgs;
+          srcTree = baoguiSrcTree pkgs;
 
-          # Packaged binary for `nix build` / install — pure, remote-builder capable.
-          # Day-to-day: prefer `nix run .#baogui` (devshell + .desktop launch below).
-          srcTree = pkgs.runCommand "baogui-src" { } ''
-            mkdir -p $out/baogui $out/vidya
-            cp -a ${lib.cleanSource ./.}/. $out/baogui/
-            cp -a ${vidya}/. $out/vidya/
-            chmod -R u+w $out
-            rm -rf $out/baogui/{target,result,result-*,.git} 2>/dev/null || true
-            rm -rf $out/vidya/{target,android-demo,host,examples,docs,.git} 2>/dev/null || true
-          '';
+          rustAndroid = pkgs.rust-bin.stable.latest.default.override {
+            extensions = [ "rust-src" ];
+            targets = [ androidTarget ];
+          };
+          rustPlatformAndroid = pkgs.makeRustPlatform {
+            cargo = rustAndroid;
+            rustc = rustAndroid;
+          };
+
+          androidComposition = pkgs.androidenv.composeAndroidPackages {
+            platformVersions = [ "34" ];
+            buildToolsVersions = [ "34.0.0" ];
+            includeNDK = true;
+            includeEmulator = false;
+            includeSystemImages = false;
+          };
+          androidSdk = androidComposition.androidsdk;
+          androidSdkRoot = "${androidSdk}/libexec/android-sdk";
 
           baogui = pkgs.rustPlatform.buildRustPackage {
             pname = "baogui";
             version = "0.1.0";
             src = srcTree;
-            sourceRoot = "baogui-src/baogui";
+            sourceRoot = "baogui-src-tree/baogui";
             cargoLock.lockFile = ./Cargo.lock;
 
             nativeBuildInputs = [ pkgs.makeWrapper ];
@@ -95,7 +157,6 @@
 
               install -Dm644 data/share/applications/org.openbao.baogui.desktop \
                 $out/share/applications/org.openbao.baogui.desktop
-              # Absolute Exec so the desktop file works without PATH tricks.
               substituteInPlace $out/share/applications/org.openbao.baogui.desktop \
                 --replace-fail 'Exec=baogui' "Exec=$out/bin/baogui"
 
@@ -113,10 +174,141 @@
               platforms = lib.platforms.linux;
             };
           };
+
+          baogui-android = pkgs.stdenv.mkDerivation {
+            pname = "baogui-android";
+            version = "0.1.0";
+            src = srcTree;
+
+            cargoRoot = "baogui/android";
+            cargoDeps = rustPlatformAndroid.importCargoLock {
+              lockFile = ./android/Cargo.lock;
+              allowBuiltinFetchGit = true;
+            };
+
+            nativeBuildInputs = [
+              rustAndroid
+              pkgs.cargo-apk
+              pkgs.jdk17_headless
+              pkgs.python3
+              rustPlatformAndroid.cargoSetupHook
+            ];
+
+            strictDeps = true;
+            dontUseCmakeConfigure = true;
+            disallowedReferences = [ rustAndroid ];
+
+            ANDROID_HOME = androidSdkRoot;
+            ANDROID_SDK_ROOT = androidSdkRoot;
+            ANDROID_NDK_HOME = "${androidSdkRoot}/ndk-bundle";
+            ANDROID_NDK_ROOT = "${androidSdkRoot}/ndk-bundle";
+
+            buildPhase = ''
+              runHook preBuild
+
+              export HOME="$TMPDIR/home"
+              mkdir -p "$HOME/.android"
+
+              keystore="$(pwd)/baogui/android/ci.keystore"
+              [[ -f "$keystore" ]] || {
+                echo "missing CI keystore at $keystore" >&2
+                exit 1
+              }
+
+              ndk="$ANDROID_NDK_HOME"
+              if [[ ! -d "$ndk" ]]; then
+                ndk="$(echo "$ANDROID_HOME"/ndk/* | awk '{print $1}')"
+                export ANDROID_NDK_HOME="$ndk"
+                export ANDROID_NDK_ROOT="$ndk"
+              fi
+              [[ -d "$ndk" ]] || {
+                echo "Android NDK not found under $ANDROID_HOME" >&2
+                ls -la "$ANDROID_HOME" >&2 || true
+                exit 1
+              }
+
+              prebuilt=""
+              for host in linux-x86_64 linux-aarch64; do
+                if [[ -d "$ndk/toolchains/llvm/prebuilt/$host/bin" ]]; then
+                  prebuilt="$ndk/toolchains/llvm/prebuilt/$host/bin"
+                  break
+                fi
+              done
+              [[ -n "$prebuilt" ]] || {
+                echo "NDK llvm prebuilt toolchain not found under $ndk" >&2
+                exit 1
+              }
+              export PATH="$prebuilt:$PATH"
+
+              export CC_aarch64_linux_android="aarch64-linux-android${androidApiLevel}-clang"
+              export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CC_aarch64_linux_android"
+              export AR_aarch64_linux_android=llvm-ar
+              export CARGO_TARGET_AARCH64_LINUX_ANDROID_AR=llvm-ar
+
+              pushd baogui/android >/dev/null
+              if ! grep -q 'signing.release' Cargo.toml; then
+                python3 - "$keystore" <<'PY'
+import pathlib, sys
+keystore = sys.argv[1]
+path = pathlib.Path("Cargo.toml")
+text = path.read_text()
+block = f"""
+[package.metadata.android.signing.release]
+path = "{keystore}"
+keystore_password = "android"
+key_alias = "androiddebugkey"
+key_password = "android"
+"""
+path.write_text(text + block)
+PY
+              fi
+              cargo apk build --release --target ${androidTarget} -p baogui-android --lib
+              popd >/dev/null
+
+              runHook postBuild
+            '';
+
+            installPhase = ''
+              runHook preInstall
+              mkdir -p $out
+              apk=""
+              for cand in \
+                baogui/android/target/release/apk/baogui.apk \
+                baogui/android/target/baogui.apk \
+                baogui/android/target/release/apk/baogui-release.apk; do
+                if [[ -f "$cand" ]]; then
+                  apk="$cand"
+                  break
+                fi
+              done
+              if [[ -z "''${apk:-}" ]]; then
+                apk="$(find baogui/android/target -type f -path '*/release/apk/*.apk' ! -name '*-unaligned.apk' 2>/dev/null | head -1 || true)"
+              fi
+              [[ -n "''${apk:-}" && -f "$apk" ]] || {
+                echo "APK not found under baogui/android/target" >&2
+                find baogui/android/target -name '*.apk' 2>/dev/null | head -20 >&2 || true
+                exit 1
+              }
+              cp "$apk" $out/baogui.apk
+              apksigner="$(echo "$ANDROID_HOME"/build-tools/*/apksigner | awk '{print $NF}')"
+              "$apksigner" verify --verbose "$out/baogui.apk"
+              "$apksigner" verify --print-certs "$out/baogui.apk" | grep -q 'CN=BaoGUI CI'
+              ln -s baogui.apk $out/app.apk
+              runHook postInstall
+            '';
+
+            meta = {
+              description = "BaoGUI Android APK (aarch64)";
+              homepage = "https://openbao.org/";
+              license = lib.licenses.mit;
+            };
+          };
         in
         {
           default = baogui;
-          baogui = baogui;
+          inherit baogui;
+          android = baogui-android;
+          inherit baogui-android;
         }
       );
 
@@ -127,7 +319,6 @@
           inherit (pkgs) lib;
           libs = eguiLibs pkgs;
           libPath = lib.makeLibraryPath libs;
-          # Prefer host rustup/cargo; only pull small nix deps (not nixpkgs rustc ~1GiB).
           appTools = with pkgs; [ pkg-config ];
           requireCargo = ''
             if ! command -v cargo >/dev/null; then
@@ -136,7 +327,6 @@
             fi
           '';
 
-          # Stage FreeDesktop tree so Wayland can resolve icons via app_id.
           stageXdg = ''
             xdg="$PWD/target/xdg-data"
             mkdir -p "$xdg/applications"
@@ -150,12 +340,10 @@
             done
             desktop="$xdg/applications/org.openbao.baogui.desktop"
             install -m 644 "${desktopTemplate}" "$desktop"
-            # Exec is filled after cargo produces a binary (debug for run, release for build).
             install -m 644 "$desktop" "$PWD/target/org.openbao.baogui.desktop"
             export XDG_DATA_DIRS="$xdg''${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
           '';
 
-          # Local cargo build (host rustc/cargo).
           build = pkgs.writeShellApplication {
             name = "baogui-build";
             runtimeInputs = appTools;
@@ -166,7 +354,6 @@
               echo "→ cargo build $*"
               cargo build "$@"
               bin="$PWD/target/debug/baogui"
-              # Prefer release binary if the user passed --release.
               if [ -x "$PWD/target/release/baogui" ] && printf '%s\n' "$*" | grep -q -- '--release'; then
                 bin="$PWD/target/release/baogui"
               fi
@@ -181,7 +368,6 @@
             '';
           };
 
-          # Stage .desktop/icons, then cargo run with host rustc/cargo.
           baoguiApp = pkgs.writeShellApplication {
             name = "baogui";
             runtimeInputs = appTools;
@@ -190,7 +376,6 @@
               ${requireCargo}
               ${stageXdg}
 
-              # Point desktop Exec at the debug binary cargo run will use.
               bin="$PWD/target/debug/baogui"
               bin_esc=''${bin//\\/\\\\}
               bin_esc=''${bin_esc//&/\\&}
@@ -228,10 +413,9 @@
         in
         {
           default = pkgs.mkShell {
-            # Host rustup for rustc/cargo; this shell only adds egui link libs + helpers.
             packages = with pkgs; [
               pkg-config
-              glib # gio launch
+              glib
               rust-analyzer
             ];
             buildInputs = libs;
@@ -243,6 +427,7 @@
               echo "  nix run .#build              # cargo build"
               echo "  cargo run                    # from this shell"
               echo "  nix build .#baogui           # pure package (+ installed .desktop)"
+              echo "  nix build .#android          # pure APK (aarch64, CI)"
             '';
           };
         }
