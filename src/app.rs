@@ -11,7 +11,7 @@ use vidya::{
     title_2, Col, ColKind, Icon, Theme,
 };
 
-use crate::api::{Client, SecretData};
+use crate::api::{Client, SearchIndex, SearchMatch, SecretData};
 
 const TOAST_SECS: u64 = 3;
 const SIDEBAR_W: f32 = 260.0;
@@ -41,9 +41,20 @@ struct SearchHit {
     value: String,
 }
 
+impl From<SearchMatch> for SearchHit {
+    fn from(m: SearchMatch) -> Self {
+        Self {
+            path: m.path,
+            key: m.key,
+            value: m.value,
+        }
+    }
+}
+
 struct SearchResultMsg {
     cache_key: String,
     hits: Result<Vec<SearchHit>, String>,
+    index: SearchIndex,
 }
 
 pub struct BaoGuiApp {
@@ -77,6 +88,8 @@ pub struct BaoGuiApp {
     /// Filter string the current debounce timer is waiting on.
     search_debounce_for: Option<String>,
     search_rx: Option<mpsc::Receiver<SearchResultMsg>>,
+    /// Cached mount paths + secret payloads; reused across filter changes.
+    search_index: SearchIndex,
 
     // Detail
     show_detail: bool,
@@ -130,6 +143,7 @@ impl BaoGuiApp {
             search_debounce: None,
             search_debounce_for: None,
             search_rx: None,
+            search_index: SearchIndex::default(),
             show_detail: false,
             path_display: String::new(),
             meta: String::new(),
@@ -216,6 +230,7 @@ impl BaoGuiApp {
 
         self.client = Some(client);
         self.mount = mount;
+        self.search_index = SearchIndex::default();
         self.folder.clear();
         self.current_path.clear();
         self.path_display.clear();
@@ -241,6 +256,7 @@ impl BaoGuiApp {
         self.current_path.clear();
         self.list_keys.clear();
         self.list_filter.clear();
+        self.search_index = SearchIndex::default();
         self.clear_search();
         self.kv_rows.clear();
         self.show_detail = false;
@@ -271,7 +287,7 @@ impl BaoGuiApp {
                 self.show_toast(format!("List failed: {e}"));
             }
         }
-        self.invalidate_search();
+        self.invalidate_search_index();
     }
 
     fn search_cache_key(mount: &str, filter: &str) -> String {
@@ -295,6 +311,11 @@ impl BaoGuiApp {
         self.search_rx = None;
     }
 
+    fn invalidate_search_index(&mut self) {
+        self.search_index = SearchIndex::default();
+        self.invalidate_search();
+    }
+
     fn invalidate_search(&mut self) {
         self.search_cache_key.clear();
         self.search_debounce = None;
@@ -316,6 +337,7 @@ impl BaoGuiApp {
                     }
                 }
                 self.search_cache_key = msg.cache_key;
+                self.search_index = msg.index;
             }
             self.search_rx = None;
         }
@@ -331,11 +353,19 @@ impl BaoGuiApp {
             .split_once('\0')
             .map(|(_, f)| f.to_string())
             .unwrap_or_default();
+        let mut index = self.search_index.clone();
         let (tx, rx) = mpsc::channel();
         self.search_rx = Some(rx);
         std::thread::spawn(move || {
-            let hits = compute_search_hits(&client, &mount, &filter).map_err(|e| e.to_string());
-            let _ = tx.send(SearchResultMsg { cache_key, hits });
+            let hits = client
+                .search_secrets(&mount, &filter, &mut index)
+                .map(|matches| matches.into_iter().map(SearchHit::from).collect())
+                .map_err(|e| e.to_string());
+            let _ = tx.send(SearchResultMsg {
+                cache_key,
+                hits,
+                index,
+            });
         });
     }
 
@@ -1360,37 +1390,6 @@ impl BaoGuiApp {
                     });
             });
     }
-}
-
-fn compute_search_hits(
-    client: &Client,
-    mount: &str,
-    filter: &str,
-) -> Result<Vec<SearchHit>, crate::api::ApiError> {
-    let filter = filter.to_lowercase();
-    let paths = client.list_all_secret_paths(mount)?;
-    let mut hits = Vec::new();
-
-    for full in paths {
-        let path_match = full.to_lowercase().contains(&filter);
-        let secret = match client.read_secret(mount, &full) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        for (k, v) in &secret.data {
-            let key_match = k.to_lowercase().contains(&filter);
-            let val_match = v.to_lowercase().contains(&filter);
-            if path_match || key_match || val_match {
-                hits.push(SearchHit {
-                    path: full.clone(),
-                    key: k.clone(),
-                    value: v.clone(),
-                });
-            }
-        }
-    }
-    hits.sort_by(|a, b| (&a.path, &a.key).cmp(&(&b.path, &b.key)));
-    Ok(hits)
 }
 
 fn parse_kv_lines(text: &str) -> BTreeMap<String, String> {
