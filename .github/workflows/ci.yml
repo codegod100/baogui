@@ -106,8 +106,7 @@ jobs:
           apk="$(find artifact -name '*.apk' | head -1)"
           [[ -f "$apk" ]]
           boxd machine resume "$BOXD_SMOKE_NAME" 2>/dev/null || true
-          boxd machine exec "$BOXD_SMOKE_NAME" -- mkdir -p /tmp/smoke
-          boxd machine upload "$BOXD_SMOKE_NAME" "$apk" /tmp/smoke/baogui.apk
+          boxd machine cp "$apk" "$BOXD_SMOKE_NAME:/tmp/smoke/baogui.apk"
           boxd machine exec "$BOXD_SMOKE_NAME" -- bash -lc \
             'cd /opt/baogui && git pull --ff-only && ./scripts/apk-smoke.sh --ci /tmp/smoke/baogui.apk'
 
