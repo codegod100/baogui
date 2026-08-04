@@ -177,12 +177,44 @@ ensure_vidya_sibling() {
   git clone --depth 1 -b main "$VIDYA_URL" "$VIDYA_DIR"
 }
 
+ensure_rust_toolchain() {
+  export PATH="${HOME}/.cargo/bin:/usr/local/cargo/bin:${PATH}"
+  export CARGO_HOME="${HOME}/.cargo"
+  export RUSTUP_HOME="${HOME}/.rustup"
+
+  if ! command -v rustup >/dev/null 2>&1; then
+    log "installing rustup..."
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --default-toolchain stable --profile minimal
+  fi
+
+  # shellcheck disable=SC1091
+  [[ -f "${HOME}/.cargo/env" ]] && . "${HOME}/.cargo/env"
+  export PATH="${HOME}/.cargo/bin:${PATH}"
+
+  local min_major=1 min_minor=85
+  local ver major minor
+  ver="$(rustc --version 2>/dev/null | awk '{print $2}')"
+  major="${ver%%.*}"
+  minor="${ver#*.}"
+  minor="${minor%%.*}"
+  if [[ -z "$ver" ]] || [[ "$major" -lt "$min_major" ]] \
+    || { [[ "$major" -eq "$min_major" ]] && [[ "$minor" -lt "$min_minor" ]]; }; then
+    log "ensuring stable Rust >= ${min_major}.${min_minor} (have: ${ver:-none})"
+    rustup toolchain install stable
+    rustup default stable
+  fi
+
+  log "rustc ready ($(rustc --version 2>/dev/null | head -1))"
+}
+
 warm_cargo_deps() {
+  ensure_rust_toolchain
   if ! command -v cargo >/dev/null 2>&1; then
     log "skipping cargo fetch (cargo not on PATH)"
     return 0
   fi
-  log "fetching cargo dependencies..."
+  log "fetching cargo dependencies ($(cargo --version 2>&1 | head -1))..."
   cargo fetch
 }
 

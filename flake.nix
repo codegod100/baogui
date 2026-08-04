@@ -124,7 +124,10 @@
 
           rustAndroid = pkgs.rust-bin.stable.latest.default.override {
             extensions = [ "rust-src" ];
-            targets = [ androidTarget ];
+            targets = [
+              androidTarget
+              "x86_64-linux-android"
+            ];
           };
           rustPlatformAndroid = pkgs.makeRustPlatform {
             cargo = rustAndroid;
@@ -303,12 +306,75 @@ PY
               license = lib.licenses.mit;
             };
           };
+
+          waydroidDisplay = {
+            width = "1080";
+            height = "2400";
+            lcdDensity = "420";
+          };
+          mkWaydroidApp =
+            {
+              name,
+              release ? false,
+            }:
+            pkgs.writeShellApplication {
+              inherit name;
+              runtimeInputs = [
+                rustAndroid
+                pkgs.cargo-apk
+                pkgs.android-tools
+                pkgs.jdk17_headless
+                pkgs.python3
+                pkgs.findutils
+                pkgs.gawk
+                pkgs.gnugrep
+                pkgs.coreutils
+                pkgs.bash
+                pkgs.procps
+              ];
+              text = ''
+                set -euo pipefail
+                export ANDROID_HOME="''${ANDROID_HOME:-${androidSdkRoot}}"
+                export ANDROID_SDK_ROOT="''${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+                export ANDROID_NDK_HOME="''${ANDROID_NDK_HOME:-${androidSdkRoot}/ndk-bundle}"
+                export ANDROID_NDK_ROOT="''${ANDROID_NDK_ROOT:-$ANDROID_NDK_HOME}"
+                if [[ ! -d "$ANDROID_NDK_HOME" ]]; then
+                  ndk="$(echo "$ANDROID_HOME"/ndk/* | awk '{print $1}')"
+                  if [[ -n "''${ndk:-}" && -d "$ndk" ]]; then
+                    export ANDROID_NDK_HOME="$ndk"
+                    export ANDROID_NDK_ROOT="$ndk"
+                  fi
+                fi
+                export BAOGUI_WAYDROID_WIDTH="''${BAOGUI_WAYDROID_WIDTH:-${waydroidDisplay.width}}"
+                export BAOGUI_WAYDROID_HEIGHT="''${BAOGUI_WAYDROID_HEIGHT:-${waydroidDisplay.height}}"
+                export BAOGUI_WAYDROID_LCD_DENSITY="''${BAOGUI_WAYDROID_LCD_DENSITY:-${waydroidDisplay.lcdDensity}}"
+                export BAOGUI_WAYDROID_SHOW_UI="''${BAOGUI_WAYDROID_SHOW_UI:-1}"
+                export BAOGUI_WAYDROID_START_SESSION="''${BAOGUI_WAYDROID_START_SESSION:-1}"
+                export BAOGUI_WAYDROID_RELEASE="''${BAOGUI_WAYDROID_RELEASE:-${if release then "1" else "0"}}"
+                script=""
+                if [[ -f ./scripts/waydroid.sh ]]; then
+                  script=./scripts/waydroid.sh
+                else
+                  script="${./scripts/waydroid.sh}"
+                fi
+                exec bash "$script" "$@"
+              '';
+            };
+          run-waydroid = mkWaydroidApp { name = "waydroid"; };
+          run-waydroid-release = mkWaydroidApp {
+            name = "waydroid-release";
+            release = true;
+          };
         in
         {
           default = baogui;
           inherit baogui;
           android = baogui-android;
           inherit baogui-android;
+          waydroid = run-waydroid;
+          inherit run-waydroid;
+          waydroid-release = run-waydroid-release;
+          inherit run-waydroid-release;
         }
       );
 
@@ -402,6 +468,14 @@ PY
             type = "app";
             program = "${build}/bin/baogui-build";
           };
+          waydroid = {
+            type = "app";
+            program = "${self.packages.${system}.waydroid}/bin/waydroid";
+          };
+          waydroid-release = {
+            type = "app";
+            program = "${self.packages.${system}.waydroid-release}/bin/waydroid-release";
+          };
         }
       );
 
@@ -428,6 +502,7 @@ PY
               echo "  cargo run                    # from this shell"
               echo "  nix build .#baogui           # pure package (+ installed .desktop)"
               echo "  nix build .#android          # pure APK (aarch64, CI)"
+              echo "  nix run .#waydroid           # cargo-apk x86_64 → Waydroid"
             '';
           };
         }

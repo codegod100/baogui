@@ -36,7 +36,7 @@ winit = { version = "0.30", default-features = false, features = ["android-nativ
 [package.metadata.android]
 package = "org.openbao.baogui"
 apk_name = "baogui"
-build_targets = ["aarch64-linux-android"]
+  build_targets = ["aarch64-linux-android", "x86_64-linux-android"]
 
 [[package.metadata.android.uses_permission]]
 name = "android.permission.INTERNET"
