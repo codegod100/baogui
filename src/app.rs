@@ -1020,12 +1020,12 @@ impl BaoGuiApp {
                 let mut save_clicked = false;
                 let mut add_key = false;
                 let reveal_label = if self.reveal_values {
-                    "Hide values"
+                    (Icon::EyeOff, "Hide values")
                 } else {
-                    "Show values"
+                    (Icon::Eye, "Show values")
                 };
                 ui.horizontal(|ui| {
-                    if button(ui, th, reveal_label).clicked() {
+                    if icon_button(ui, th, reveal_label.0, reveal_label.1).clicked() {
                         reveal_clicked = true;
                     }
                     if button(ui, th, "Add key").clicked() {
@@ -1165,12 +1165,12 @@ impl BaoGuiApp {
                 );
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let reveal_label = if self.reveal_values {
-                    "Hide values"
+                let (icon, tip) = if self.reveal_values {
+                    (Icon::EyeOff, "Hide values")
                 } else {
-                    "Show values"
+                    (Icon::Eye, "Show values")
                 };
-                if button(ui, th, reveal_label).clicked() {
+                if icon_button(ui, th, icon, tip).clicked() {
                     self.reveal_values = !self.reveal_values;
                 }
             });
