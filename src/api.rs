@@ -5,6 +5,8 @@ use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use rayon::prelude::*;
+
 #[derive(Debug, Clone)]
 pub struct Client {
     base_url: String,
@@ -50,6 +52,20 @@ pub struct SecretData {
     pub data: BTreeMap<String, String>,
     pub version: Option<u64>,
     pub created_time: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SearchIndex {
+    pub mount: String,
+    pub paths: Vec<String>,
+    secrets: BTreeMap<String, SecretData>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchMatch {
+    pub path: String,
+    pub key: String,
+    pub value: String,
 }
 
 impl Client {
@@ -327,6 +343,79 @@ impl Client {
         self.send(self.request(reqwest::Method::DELETE, &api_path))?;
         Ok(())
     }
+
+    /// Build or refresh a mount index, fetching any uncached secrets in parallel.
+    pub fn ensure_search_index(&self, mount: &str, index: &mut SearchIndex) -> Result<(), ApiError> {
+        if index.mount != mount {
+            *index = SearchIndex {
+                mount: mount.to_string(),
+                ..Default::default()
+            };
+        }
+        if index.paths.is_empty() {
+            index.paths = self.list_all_secret_paths(mount)?;
+        }
+
+        let missing: Vec<String> = index
+            .paths
+            .iter()
+            .filter(|path| !index.secrets.contains_key(*path))
+            .cloned()
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+
+        let client = self.clone();
+        let mount = mount.to_string();
+        let fetched: Vec<(String, SecretData)> = missing
+            .par_iter()
+            .filter_map(|path| {
+                client
+                    .read_secret(&mount, path)
+                    .ok()
+                    .map(|secret| (path.clone(), secret))
+            })
+            .collect();
+        for (path, secret) in fetched {
+            index.secrets.insert(path, secret);
+        }
+        Ok(())
+    }
+
+    /// Filter a warmed index for path / key / value matches.
+    pub fn search_secrets(
+        &self,
+        mount: &str,
+        filter: &str,
+        index: &mut SearchIndex,
+    ) -> Result<Vec<SearchMatch>, ApiError> {
+        self.ensure_search_index(mount, index)?;
+        let filter = filter.to_lowercase();
+        let mut hits = Vec::new();
+
+        for full in &index.paths {
+            let path_match = full.to_lowercase().contains(&filter);
+            let secret = match index.secrets.get(full) {
+                Some(s) => s,
+                None => continue,
+            };
+            for (k, v) in &secret.data {
+                let key_match = k.to_lowercase().contains(&filter);
+                let val_match = v.to_lowercase().contains(&filter);
+                if path_match || key_match || val_match {
+                    hits.push(SearchMatch {
+                        path: full.clone(),
+                        key: k.clone(),
+                        value: v.clone(),
+                    });
+                }
+            }
+        }
+
+        hits.sort_by(|a, b| (&a.path, &a.key).cmp(&(&b.path, &b.key)));
+        Ok(hits)
+    }
 }
 
 fn value_to_string(v: &Value) -> String {
@@ -383,6 +472,34 @@ mod tests {
             extract_list_keys(&v),
             vec!["ai-api-keys".to_string(), "foo/".to_string()]
         );
+    }
+
+    #[test]
+    fn search_index_filters_locally() {
+        let client = Client::new("http://127.0.0.1:8200", "token").unwrap();
+        let mut index = SearchIndex {
+            mount: "secret".into(),
+            paths: vec!["ai-api-keys".into()],
+            secrets: BTreeMap::from([(
+                "ai-api-keys".into(),
+                SecretData {
+                    data: BTreeMap::from([
+                        ("OPENAI_API_KEY".into(), "sk-test".into()),
+                        ("OTHER".into(), "value".into()),
+                    ]),
+                    version: None,
+                    created_time: None,
+                },
+            )]),
+        };
+
+        let hits = client.search_secrets("secret", "openai", &mut index).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].key, "OPENAI_API_KEY");
+
+        let hits = client.search_secrets("secret", "sk-test", &mut index).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].value, "sk-test");
     }
 
     #[test]

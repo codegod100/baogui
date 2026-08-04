@@ -1,19 +1,21 @@
 //! BaoGUI window: connect form + secret browser / editor.
 
 use std::collections::BTreeMap;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align, Key, Layout, RichText, ScrollArea, TextEdit, Vec2};
 use vidya::{
-    apply, body, button, card, central_page, data_table, destructive_button, dim_label,
-    icon_button, primary_button, table_text, text_field_multiline, text_field_singleline, title,
+    apply, body, button, card, central_page, data_table_fixed, destructive_button, dim_label,
+    icon_button, measure_body_mono, primary_button, table_text_sized, text_field_multiline, text_field_singleline, title,
     title_2, Col, ColKind, Icon, Theme,
 };
 
-use crate::api::{Client, SecretData};
+use crate::api::{Client, SearchIndex, SearchMatch, SecretData};
 
 const TOAST_SECS: u64 = 3;
 const SIDEBAR_W: f32 = 260.0;
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(400);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Screen {
@@ -37,6 +39,22 @@ struct SearchHit {
     path: String,
     key: String,
     value: String,
+}
+
+impl From<SearchMatch> for SearchHit {
+    fn from(m: SearchMatch) -> Self {
+        Self {
+            path: m.path,
+            key: m.key,
+            value: m.value,
+        }
+    }
+}
+
+struct SearchResultMsg {
+    cache_key: String,
+    hits: Result<Vec<SearchHit>, String>,
+    index: SearchIndex,
 }
 
 pub struct BaoGuiApp {
@@ -65,6 +83,13 @@ pub struct BaoGuiApp {
     search_hits: Vec<SearchHit>,
     /// Cache key: `mount\\0filter` for the last computed `search_hits`.
     search_cache_key: String,
+    /// Debounced search: run after typing pauses so we never block the UI thread.
+    search_debounce: Option<Instant>,
+    /// Filter string the current debounce timer is waiting on.
+    search_debounce_for: Option<String>,
+    search_rx: Option<mpsc::Receiver<SearchResultMsg>>,
+    /// Cached mount paths + secret payloads; reused across filter changes.
+    search_index: SearchIndex,
 
     // Detail
     show_detail: bool,
@@ -115,6 +140,10 @@ impl BaoGuiApp {
             list_filter: String::new(),
             search_hits: Vec::new(),
             search_cache_key: String::new(),
+            search_debounce: None,
+            search_debounce_for: None,
+            search_rx: None,
+            search_index: SearchIndex::default(),
             show_detail: false,
             path_display: String::new(),
             meta: String::new(),
@@ -201,6 +230,7 @@ impl BaoGuiApp {
 
         self.client = Some(client);
         self.mount = mount;
+        self.search_index = SearchIndex::default();
         self.folder.clear();
         self.current_path.clear();
         self.path_display.clear();
@@ -226,8 +256,8 @@ impl BaoGuiApp {
         self.current_path.clear();
         self.list_keys.clear();
         self.list_filter.clear();
-        self.search_hits.clear();
-        self.search_cache_key.clear();
+        self.search_index = SearchIndex::default();
+        self.clear_search();
         self.kv_rows.clear();
         self.show_detail = false;
         self.new_dialog = None;
@@ -257,59 +287,133 @@ impl BaoGuiApp {
                 self.show_toast(format!("List failed: {e}"));
             }
         }
-        self.search_cache_key.clear();
+        self.invalidate_search_index();
     }
 
-    /// Scan every secret under the mount for path / key / value matches.
-    fn ensure_search_hits(&mut self) {
+    fn search_cache_key(mount: &str, filter: &str) -> String {
+        format!("{mount}\0{filter}")
+    }
+
+    fn wanted_search_key(&self) -> Option<String> {
         let filter = self.list_filter.trim().to_lowercase();
         if filter.is_empty() {
-            self.search_hits.clear();
-            self.search_cache_key.clear();
-            return;
+            None
+        } else {
+            Some(Self::search_cache_key(&self.mount, &filter))
         }
-        let cache_key = format!("{}\0{filter}", self.mount);
-        if self.search_cache_key == cache_key {
-            return;
-        }
+    }
 
+    fn clear_search(&mut self) {
         self.search_hits.clear();
+        self.search_cache_key.clear();
+        self.search_debounce = None;
+        self.search_debounce_for = None;
+        self.search_rx = None;
+    }
+
+    fn invalidate_search_index(&mut self) {
+        self.search_index = SearchIndex::default();
+        self.invalidate_search();
+    }
+
+    fn invalidate_search(&mut self) {
+        self.search_cache_key.clear();
+        self.search_debounce = None;
+        self.search_debounce_for = None;
+        self.search_rx = None;
+    }
+
+    fn poll_search(&mut self) {
+        let Some(rx) = &self.search_rx else {
+            return;
+        };
+        if let Ok(msg) = rx.try_recv() {
+            if self.wanted_search_key().as_deref() == Some(msg.cache_key.as_str()) {
+                match msg.hits {
+                    Ok(hits) => self.search_hits = hits,
+                    Err(e) => {
+                        self.search_hits.clear();
+                        self.show_toast(format!("Search failed: {e}"));
+                    }
+                }
+                self.search_cache_key = msg.cache_key;
+                self.search_index = msg.index;
+            }
+            self.search_rx = None;
+        }
+    }
+
+    fn spawn_search(&mut self, cache_key: String) {
         let Some(client) = self.client.clone() else {
             self.search_cache_key = cache_key;
             return;
         };
         let mount = self.mount.clone();
+        let filter = cache_key
+            .split_once('\0')
+            .map(|(_, f)| f.to_string())
+            .unwrap_or_default();
+        let mut index = self.search_index.clone();
+        let (tx, rx) = mpsc::channel();
+        self.search_rx = Some(rx);
+        std::thread::spawn(move || {
+            let hits = client
+                .search_secrets(&mount, &filter, &mut index)
+                .map(|matches| matches.into_iter().map(SearchHit::from).collect())
+                .map_err(|e| e.to_string());
+            let _ = tx.send(SearchResultMsg {
+                cache_key,
+                hits,
+                index,
+            });
+        });
+    }
 
-        let paths = match client.list_all_secret_paths(&mount) {
-            Ok(p) => p,
-            Err(e) => {
-                self.show_toast(format!("Search failed: {e}"));
-                self.search_cache_key = cache_key;
-                return;
-            }
+    /// Debounce keystrokes and run mount-wide search off the UI thread.
+    fn tick_search(&mut self, ctx: &egui::Context) {
+        self.poll_search();
+
+        let Some(wanted_key) = self.wanted_search_key() else {
+            self.clear_search();
+            return;
         };
 
-        for full in paths {
-            let path_match = full.to_lowercase().contains(&filter);
-            let secret = match client.read_secret(&mount, &full) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            for (k, v) in &secret.data {
-                let key_match = k.to_lowercase().contains(&filter);
-                let val_match = v.to_lowercase().contains(&filter);
-                if path_match || key_match || val_match {
-                    self.search_hits.push(SearchHit {
-                        path: full.clone(),
-                        key: k.clone(),
-                        value: v.clone(),
-                    });
-                }
-            }
+        if self.search_cache_key == wanted_key {
+            self.search_debounce = None;
+            self.search_debounce_for = None;
+            return;
         }
-        self.search_hits
-            .sort_by(|a, b| (&a.path, &a.key).cmp(&(&b.path, &b.key)));
-        self.search_cache_key = cache_key;
+
+        if self.search_rx.is_some() {
+            ctx.request_repaint();
+            return;
+        }
+
+        if self.search_debounce_for.as_deref() != Some(wanted_key.as_str()) {
+            self.search_debounce_for = Some(wanted_key.clone());
+            let deadline = Instant::now() + SEARCH_DEBOUNCE;
+            self.search_debounce = Some(deadline);
+            ctx.request_repaint_after(SEARCH_DEBOUNCE);
+            return;
+        }
+
+        let Some(deadline) = self.search_debounce else {
+            return;
+        };
+        if Instant::now() < deadline {
+            ctx.request_repaint_after(deadline.saturating_duration_since(Instant::now()));
+            return;
+        }
+
+        self.search_debounce = None;
+        self.search_debounce_for = None;
+        self.spawn_search(wanted_key);
+        ctx.request_repaint();
+    }
+
+    fn search_busy(&self) -> bool {
+        self.wanted_search_key()
+            .is_some_and(|key| key != self.search_cache_key)
     }
 
     /// Open a secret by full mount-relative path (navigates folder + loads detail).
@@ -324,8 +428,7 @@ impl BaoGuiApp {
             self.folder.clear();
         }
         self.list_filter.clear();
-        self.search_hits.clear();
-        self.search_cache_key.clear();
+        self.clear_search();
         self.refresh_list();
 
         let Some(client) = self.client.clone() else {
@@ -707,15 +810,11 @@ impl BaoGuiApp {
             });
 
         // Global search before panels so the table + sidebar share one hit list.
-        if !self.list_filter.trim().is_empty() {
-            self.ensure_search_hits();
-        } else {
-            self.search_hits.clear();
-            self.search_cache_key.clear();
-        }
+        self.tick_search(ctx);
 
         let filter = self.list_filter.trim().to_lowercase();
         let searching = !filter.is_empty();
+        let search_busy = self.search_busy();
         let visible: Vec<String> = if searching {
             let mut paths: Vec<String> = self
                 .search_hits
@@ -785,7 +884,15 @@ impl BaoGuiApp {
                     .show(ui, |ui| {
                         if searching {
                             if visible.is_empty() {
-                                dim_label(ui, th, "(no matches)");
+                                dim_label(
+                                    ui,
+                                    th,
+                                    if search_busy {
+                                        "(searching…)"
+                                    } else {
+                                        "(no matches)"
+                                    },
+                                );
                                 return;
                             }
                             let mut clicked: Option<String> = None;
@@ -913,12 +1020,12 @@ impl BaoGuiApp {
                 let mut save_clicked = false;
                 let mut add_key = false;
                 let reveal_label = if self.reveal_values {
-                    "Hide values"
+                    (Icon::EyeOff, "Hide values")
                 } else {
-                    "Show values"
+                    (Icon::Eye, "Show values")
                 };
                 ui.horizontal(|ui| {
-                    if button(ui, th, reveal_label).clicked() {
+                    if icon_button(ui, th, reveal_label.0, reveal_label.1).clicked() {
                         reveal_clicked = true;
                     }
                     if button(ui, th, "Add key").clicked() {
@@ -1058,12 +1165,12 @@ impl BaoGuiApp {
                 );
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let reveal_label = if self.reveal_values {
-                    "Hide values"
+                let (icon, tip) = if self.reveal_values {
+                    (Icon::EyeOff, "Hide values")
                 } else {
-                    "Show values"
+                    (Icon::Eye, "Show values")
                 };
-                if button(ui, th, reveal_label).clicked() {
+                if icon_button(ui, th, icon, tip).clicked() {
                     self.reveal_values = !self.reveal_values;
                 }
             });
@@ -1074,7 +1181,15 @@ impl BaoGuiApp {
         ui.add_space(th.spacing.sm);
 
         if n == 0 {
-            dim_label(ui, th, "No matching keys or values in this mount.");
+            dim_label(
+                ui,
+                th,
+                if self.search_busy() {
+                    "Searching…"
+                } else {
+                    "No matching keys or values in this mount."
+                },
+            );
             return;
         }
 
@@ -1097,22 +1212,29 @@ impl BaoGuiApp {
 
         let mut open_path: Option<String> = None;
         let mut copy_val: Option<String> = None;
+        let viewport_w = ui.available_width();
+        let col_widths = search_table_col_widths(ui, th, &hits, reveal, viewport_w);
 
-        ScrollArea::vertical()
+        ScrollArea::both()
             .id_salt("search_hits")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                data_table(ui, th, "search_hits_table", &cols, |ui, i| {
+                data_table_fixed(ui, th, "search_hits_table", &cols, &col_widths, |ui, i, col_max| {
                     let hit = &hits[i];
-                    let path_resp = ui.add(
-                        egui::Label::new(
-                            RichText::new(&hit.path)
-                                .size(th.type_scale.body)
-                                .monospace()
-                                .color(th.palette.accent),
+                    let path_w = col_max.first().copied().unwrap_or(1.0);
+                    let path_resp = ui.scope(|ui| {
+                        ui.set_min_width(path_w);
+                        ui.set_max_width(path_w);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&hit.path)
+                                    .size(th.type_scale.body)
+                                    .monospace()
+                                    .color(th.palette.accent),
+                            )
+                            .sense(egui::Sense::click()),
                         )
-                        .sense(egui::Sense::click()),
-                    );
+                    }).inner;
                     if path_resp.clicked() {
                         open_path = Some(hit.path.clone());
                     }
@@ -1121,22 +1243,28 @@ impl BaoGuiApp {
                     }
                     path_resp.on_hover_text("Open secret");
 
-                    table_text(ui, th, &hit.key, true);
+                    let key_w = col_max.get(1).copied().unwrap_or(1.0);
+                    table_text_sized(ui, th, &hit.key, true, key_w);
 
                     let shown = if reveal {
                         hit.value.as_str()
                     } else {
                         "••••••••"
                     };
-                    let val_resp = ui.add(
-                        egui::Label::new(
-                            RichText::new(shown)
-                                .size(th.type_scale.body)
-                                .monospace()
-                                .color(th.palette.text),
+                    let val_w = col_max.get(2).copied().unwrap_or(1.0);
+                    let val_resp = ui.scope(|ui| {
+                        ui.set_min_width(val_w);
+                        ui.set_max_width(val_w);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(shown)
+                                    .size(th.type_scale.body)
+                                    .monospace()
+                                    .color(th.palette.text),
+                            )
+                            .sense(egui::Sense::click()),
                         )
-                        .sense(egui::Sense::click()),
-                    );
+                    }).inner;
                     if val_resp.clicked() {
                         copy_val = Some(hit.value.clone());
                     }
@@ -1275,6 +1403,45 @@ impl BaoGuiApp {
                     });
             });
     }
+}
+
+fn search_table_col_widths(
+    ui: &egui::Ui,
+    th: &Theme,
+    hits: &[SearchHit],
+    reveal: bool,
+    viewport_w: f32,
+) -> [f32; 3] {
+    let pad = th.spacing.md * 2.0;
+    let measure = |s: &str| measure_body_mono(ui, th, s) + pad;
+
+    let path_min = hits
+        .iter()
+        .map(|h| measure(&h.path))
+        .chain([measure("Path")])
+        .fold(120.0_f32, f32::max);
+    let key_min = hits
+        .iter()
+        .map(|h| measure(&h.key))
+        .chain([measure("Key")])
+        .fold(100.0_f32, f32::max);
+    let masked = "••••••••";
+    let val_min = hits
+        .iter()
+        .map(|h| measure(if reveal { h.value.as_str() } else { masked }))
+        .chain([measure("Value")])
+        .fold(160.0_f32, f32::max);
+
+    let gap = th.spacing.md;
+    let content_total = path_min + key_min + val_min + gap * 2.0;
+    let viewport_w = viewport_w.max(1.0);
+    if content_total >= viewport_w {
+        return [path_min, key_min, val_min];
+    }
+
+    let extra = viewport_w - content_total;
+    let share = extra / 3.0;
+    [path_min + share, key_min + share, val_min + share]
 }
 
 fn parse_kv_lines(text: &str) -> BTreeMap<String, String> {
