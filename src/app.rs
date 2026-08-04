@@ -3,12 +3,10 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use eframe::egui::{
-    self, Align, Color32, Key, Layout, RichText, ScrollArea, Sense, TextEdit, Vec2,
-};
+use eframe::egui::{self, Align, Key, Layout, RichText, ScrollArea, TextEdit, Vec2};
 use vidya::{
-    apply, body, button, destructive_button, dim_label, primary_button, text_field_multiline,
-    text_field_singleline, title, title_2, Mode, Theme,
+    apply, body, button, card, central_page, destructive_button, dim_label, icon_button,
+    primary_button, text_field_multiline, text_field_singleline, title, title_2, Icon, Theme,
 };
 
 use crate::api::{Client, SecretData};
@@ -34,13 +32,16 @@ struct NewDialog {
 }
 
 pub struct BaoGuiApp {
-    mode: Mode,
     screen: Screen,
 
     // Connect form
     address: String,
     token: String,
     connect_status: String,
+    /// When false, a stored token is used and the token field is hidden.
+    show_token_field: bool,
+    /// Fire one auto-connect with the stored token on first Connect-screen frame.
+    pending_auto_connect: bool,
 
     // Session
     client: Option<Client>,
@@ -62,6 +63,10 @@ pub struct BaoGuiApp {
     new_dialog: Option<NewDialog>,
     delete_confirm: bool,
     toast: Option<(String, Instant)>,
+
+    /// Sidebar click is deferred to the start of the next frame so we never
+    /// run blocking HTTP mid-layout (which can leave the detail pane blank).
+    pending_open: Option<String>,
 }
 
 impl BaoGuiApp {
@@ -73,27 +78,21 @@ impl BaoGuiApp {
             .or_else(|_| std::env::var("VAULT_ADDR"))
             .unwrap_or_else(|_| "http://127.0.0.1:8200".into());
 
-        let token = std::env::var("BAO_TOKEN")
-            .or_else(|_| std::env::var("VAULT_TOKEN"))
-            .ok()
-            .or_else(|| {
-                let path = std::env::var("BAO_TOKEN_PATH").ok().or_else(|| {
-                    std::env::var("HOME")
-                        .ok()
-                        .map(|h| format!("{h}/.vault-token"))
-                })?;
-                std::fs::read_to_string(path)
-                    .ok()
-                    .map(|s| s.trim().to_string())
-            })
-            .unwrap_or_default();
+        let token = load_stored_token();
+        let has_stored = !token.is_empty();
 
         Self {
-            mode: Mode::Dark,
             screen: Screen::Connect,
             address,
             token,
-            connect_status: String::new(),
+            connect_status: if has_stored {
+                "Connecting with stored token…".into()
+            } else {
+                String::new()
+            },
+            // Only ask for a token when we don't have one (or after a failed auto-try).
+            show_token_field: !has_stored,
+            pending_auto_connect: has_stored,
             client: None,
             mount: "secret".into(),
             folder: String::new(),
@@ -107,14 +106,12 @@ impl BaoGuiApp {
             new_dialog: None,
             delete_confirm: false,
             toast: None,
+            pending_open: None,
         }
     }
 
     fn theme(&self) -> Theme {
-        match self.mode {
-            Mode::Dark => Theme::dark(),
-            Mode::Light => Theme::light(),
-        }
+        Theme::dark()
     }
 
     fn show_toast(&mut self, msg: impl Into<String>) {
@@ -132,8 +129,14 @@ impl BaoGuiApp {
     fn connect(&mut self) {
         let addr = self.address.trim();
         let tok = self.token.trim();
-        if addr.is_empty() || tok.is_empty() {
-            self.connect_status = "Address and token are required.".into();
+        if addr.is_empty() {
+            self.connect_status = "Server address is required.".into();
+            self.show_token_field = self.show_token_field || tok.is_empty();
+            return;
+        }
+        if tok.is_empty() {
+            self.connect_status = "Token is required.".into();
+            self.show_token_field = true;
             return;
         }
 
@@ -142,7 +145,7 @@ impl BaoGuiApp {
         let client = match Client::new(addr, tok) {
             Ok(c) => c,
             Err(e) => {
-                self.connect_status = format!("Failed: {e}");
+                self.connect_failed(format!("Failed: {e}"), true);
                 return;
             }
         };
@@ -150,29 +153,31 @@ impl BaoGuiApp {
         match client.health() {
             Ok(h) => {
                 if h.sealed {
-                    self.connect_status = "Server is sealed.".into();
+                    self.connect_failed("Server is sealed.".into(), false);
                     return;
                 }
                 if !h.initialized {
-                    self.connect_status = "Server is not initialized.".into();
+                    self.connect_failed("Server is not initialized.".into(), false);
                     return;
                 }
             }
             Err(e) => {
-                self.connect_status = format!("Health check failed: {e}");
+                self.connect_failed(format!("Health check failed: {e}"), false);
                 return;
             }
         }
 
         if let Err(e) = client.lookup_self() {
-            self.connect_status = format!("Token invalid: {e}");
+            self.connect_failed(format!("Token invalid: {e}"), true);
             return;
         }
 
         let mount = match client.default_kv_mount() {
             Ok(m) => m,
             Err(e) => {
-                self.connect_status = e.to_string();
+                // Mounts often need a privileged token — surface the field so
+                // the user can paste a root/admin token.
+                self.connect_failed(e.to_string(), true);
                 return;
             }
         };
@@ -186,8 +191,16 @@ impl BaoGuiApp {
         self.kv_rows.clear();
         self.show_detail = false;
         self.connect_status.clear();
+        self.show_token_field = false;
         self.screen = Screen::Main;
         self.refresh_list();
+    }
+
+    fn connect_failed(&mut self, message: String, need_token: bool) {
+        self.connect_status = message;
+        if need_token {
+            self.show_token_field = true;
+        }
     }
 
     fn disconnect(&mut self) {
@@ -200,6 +213,15 @@ impl BaoGuiApp {
         self.new_dialog = None;
         self.delete_confirm = false;
         self.screen = Screen::Connect;
+        // Keep token if still stored; hide field until a retry fails.
+        let stored = load_stored_token();
+        if !stored.is_empty() {
+            self.token = stored;
+            self.show_token_field = false;
+            self.connect_status.clear();
+        } else {
+            self.show_token_field = true;
+        }
     }
 
     fn refresh_list(&mut self) {
@@ -231,17 +253,25 @@ impl BaoGuiApp {
         self.refresh_list();
     }
 
+    fn enter_folder(&mut self, folder_name: &str) {
+        let folder_name = folder_name.trim_matches('/');
+        if folder_name.is_empty() {
+            return;
+        }
+        if self.folder.is_empty() {
+            self.folder = folder_name.to_string();
+        } else {
+            self.folder = format!("{}/{}", self.folder, folder_name);
+        }
+        self.current_path.clear();
+        self.show_detail = false;
+        self.refresh_list();
+    }
+
     fn open_list_item(&mut self, name: &str) {
+        // Folders are listed with a trailing slash by KV LIST.
         if name.ends_with('/') {
-            let folder_name = name.trim_end_matches('/');
-            if self.folder.is_empty() {
-                self.folder = folder_name.to_string();
-            } else {
-                self.folder = format!("{}/{}", self.folder, folder_name);
-            }
-            self.current_path.clear();
-            self.show_detail = false;
-            self.refresh_list();
+            self.enter_folder(name);
             return;
         }
 
@@ -255,9 +285,41 @@ impl BaoGuiApp {
         };
         let mount = self.mount.clone();
 
+        // Prefer reading a leaf secret. If that 404s, treat the name as a folder
+        // prefix (some servers omit the trailing slash on intermediate paths).
         match client.read_secret(&mount, &full) {
-            Ok(secret) => self.apply_secret(&full, &secret),
-            Err(e) => self.show_toast(format!("Read failed: {e}")),
+            Ok(secret) => {
+                // Ambiguous path: empty body *and* LIST returns children → folder.
+                if secret.data.is_empty() {
+                    if let Ok(children) = client.list_secrets(&mount, &full) {
+                        if !children.is_empty() {
+                            self.enter_folder(&full);
+                            return;
+                        }
+                    }
+                }
+                self.apply_secret(&full, &secret);
+            }
+            Err(e) => {
+                let is_missing = matches!(
+                    e,
+                    crate::api::ApiError::Status { code: 404, .. }
+                );
+                if is_missing {
+                    match client.list_secrets(&mount, &full) {
+                        Ok(children) if !children.is_empty() => {
+                            self.enter_folder(&full);
+                            return;
+                        }
+                        Ok(_) => self.show_toast(format!("Not found: {full}")),
+                        Err(list_err) => {
+                            self.show_toast(format!("Read failed: {e}; list: {list_err}"))
+                        }
+                    }
+                } else {
+                    self.show_toast(format!("Read failed: {e}"));
+                }
+            }
         }
     }
 
@@ -272,18 +334,21 @@ impl BaoGuiApp {
                 value: v.clone(),
             })
             .collect();
-        let mut meta = String::new();
+        let n = self.kv_rows.len();
+        let mut meta = format!("{n} key{}", if n == 1 { "" } else { "s" });
         if let Some(v) = secret.version {
-            meta.push_str(&format!("version {v}"));
+            meta.push_str(&format!(" · version {v}"));
         }
         if let Some(t) = &secret.created_time {
-            if !meta.is_empty() {
-                meta.push_str(" · ");
-            }
+            meta.push_str(" · ");
             meta.push_str(t);
         }
         self.meta = meta;
         self.show_detail = true;
+        eprintln!(
+            "baogui: opened {path} — {n} field(s): {:?}",
+            self.kv_rows.iter().map(|r| r.key.as_str()).collect::<Vec<_>>()
+        );
     }
 
     fn collect_kv(&self) -> BTreeMap<String, String> {
@@ -385,6 +450,22 @@ impl eframe::App for BaoGuiApp {
         let th = self.theme();
         apply(ctx, &th);
 
+        // Auto-connect once with stored token before painting Connect UI.
+        if self.pending_auto_connect && self.screen == Screen::Connect {
+            self.pending_auto_connect = false;
+            self.connect();
+            if self.screen == Screen::Connect {
+                // Failed — token field becomes visible (set in connect_failed).
+                ctx.request_repaint();
+            }
+        }
+
+        // Resolve sidebar opens *before* painting so the detail pane sees data.
+        if let Some(name) = self.pending_open.take() {
+            self.open_list_item(&name);
+            ctx.request_repaint();
+        }
+
         if let Some((_, at)) = &self.toast {
             if at.elapsed() > Duration::from_secs(TOAST_SECS) {
                 self.toast = None;
@@ -408,18 +489,11 @@ impl BaoGuiApp {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     title(ui, th, "BaoGUI");
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let dark = self.mode == Mode::Dark;
-                        if button(ui, th, if dark { "Light" } else { "Dark" }).clicked() {
-                            self.mode = if dark { Mode::Light } else { Mode::Dark };
-                        }
-                    });
                 });
             });
 
-        egui::CentralPanel::default()
-            .frame(th.page_frame())
-            .show(ctx, |ui| {
+        central_page(ctx, th, "connect", |g| {
+            g.section(|ui| {
                 ui.vertical_centered(|ui| {
                     ui.add_space(th.spacing.xl * 1.5);
                     title(ui, th, "BaoGUI");
@@ -430,29 +504,41 @@ impl BaoGuiApp {
                     let form_w = ui.available_width().min(max_w);
                     ui.set_max_width(form_w);
 
-                    th.card_frame().show(ui, |ui| {
-                        ui.set_min_width(form_w - th.spacing.md * 2.0);
+                    card(ui, th, |ui| {
                         dim_label(ui, th, "Server address");
                         ui.add_space(th.spacing.xs);
                         text_field_singleline(ui, th, &mut self.address);
-                        ui.add_space(th.spacing.md);
 
-                        dim_label(ui, th, "Token");
-                        ui.add_space(th.spacing.xs);
-                        ui.add(
-                            TextEdit::singleline(&mut self.token)
-                                .password(true)
-                                .margin(th.text_edit_margin())
-                                .min_size(Vec2::new(0.0, th.spacing.control_height))
-                                .desired_width(f32::INFINITY),
-                        );
+                        if self.show_token_field {
+                            ui.add_space(th.spacing.md);
+                            dim_label(ui, th, "Token");
+                            ui.add_space(th.spacing.xs);
+                            let tw = ui.available_width().max(1.0);
+                            ui.add(
+                                TextEdit::singleline(&mut self.token)
+                                    .password(true)
+                                    .margin(th.text_edit_margin())
+                                    .min_size(Vec2::new(0.0, th.spacing.control_height))
+                                    .desired_width(tw),
+                            );
+                        } else if !self.token.is_empty() {
+                            ui.add_space(th.spacing.md);
+                            dim_label(ui, th, "Token: using stored credential");
+                            ui.add_space(th.spacing.xs);
+                            if button(ui, th, "Use a different token").clicked() {
+                                self.show_token_field = true;
+                                self.token.clear();
+                                self.connect_status.clear();
+                            }
+                        }
                     });
 
                     ui.add_space(th.spacing.lg);
+                    let can_connect = !self.address.trim().is_empty()
+                        && (self.show_token_field && !self.token.trim().is_empty()
+                            || !self.show_token_field && !self.token.is_empty());
                     if primary_button(ui, th, "Connect").clicked()
-                        || (ui.input(|i| i.key_pressed(Key::Enter))
-                            && !self.address.trim().is_empty()
-                            && !self.token.trim().is_empty())
+                        || (ui.input(|i| i.key_pressed(Key::Enter)) && can_connect)
                     {
                         self.connect();
                     }
@@ -474,72 +560,89 @@ impl BaoGuiApp {
                     dim_label(
                         ui,
                         th,
-                        "Uses BAO_ADDR / BAO_TOKEN when set.\nCompatible with Vault-style KV v2 mounts.",
+                        "Uses BAO_ADDR / BAO_TOKEN / ~/.vault-token when set.\nCompatible with Vault-style KV v2 mounts.",
                     );
                 });
             });
+        });
     }
 
     fn ui_main(&mut self, ctx: &egui::Context, th: &Theme) {
         egui::TopBottomPanel::top("main_header")
             .frame(th.header_frame())
             .show(ctx, |ui| {
+                let mut disconnect = false;
+                let mut refresh = false;
+                let mut new_secret = false;
                 ui.horizontal(|ui| {
                     if button(ui, th, "Disconnect").clicked() {
-                        self.disconnect();
-                        return;
+                        disconnect = true;
                     }
                     ui.add_space(th.spacing.sm);
-                    title_2(ui, th, "OpenBao");
+                    title_2(ui, th, "BaoGUI");
                     dim_label(ui, th, &format!("· {}/", self.mount));
-
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let dark = self.mode == Mode::Dark;
-                        if button(ui, th, if dark { "Light" } else { "Dark" }).clicked() {
-                            self.mode = if dark { Mode::Light } else { Mode::Dark };
-                        }
                         if button(ui, th, "New").clicked() {
-                            self.new_dialog = Some(NewDialog {
-                                path: String::new(),
-                                body: "key=value\n".into(),
-                            });
+                            new_secret = true;
                         }
                         if button(ui, th, "Refresh").clicked() {
-                            self.refresh_list();
+                            refresh = true;
                         }
                     });
                 });
+                if disconnect {
+                    self.disconnect();
+                    return;
+                }
+                if refresh {
+                    self.refresh_list();
+                }
+                if new_secret {
+                    self.new_dialog = Some(NewDialog {
+                        path: String::new(),
+                        body: "key=value\n".into(),
+                    });
+                }
             });
 
         egui::SidePanel::left("sidebar")
-            .exact_width(SIDEBAR_W)
             .resizable(true)
             .default_width(SIDEBAR_W)
+            .width_range(200.0..=420.0)
             .frame(
                 egui::Frame::new()
                     .fill(th.palette.view_bg)
-                    .inner_margin(egui::Margin::same(th.spacing.md as i8))
-                    .stroke(egui::Stroke::new(1.0, th.palette.border_soft)),
+                    .inner_margin(egui::Margin::symmetric(
+                        th.spacing.md as i8,
+                        th.spacing.sm as i8,
+                    ))
+                    .stroke(egui::Stroke::new(1.0_f32, th.palette.border_soft)),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     dim_label(ui, th, &format!("Mount: {}/", self.mount));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let can_up = !self.folder.is_empty();
-                        ui.add_enabled_ui(can_up, |ui| {
-                            if button(ui, th, "↑").clicked() {
+                        ui.add_enabled_ui(!self.folder.is_empty(), |ui| {
+                            if button(ui, th, "Up").clicked() {
                                 self.go_up();
                             }
                         });
                     });
                 });
                 ui.add_space(th.spacing.xs);
-                title_2(ui, th, &self.breadcrumb());
+                ui.label(
+                    RichText::new(self.breadcrumb())
+                        .size(th.type_scale.title_2)
+                        .strong()
+                        .color(th.palette.text)
+                        .monospace(),
+                );
                 ui.add_space(th.spacing.sm);
                 ui.separator();
-                ui.add_space(th.spacing.sm);
+                ui.add_space(th.spacing.xs);
 
                 ScrollArea::vertical()
+                    .id_salt("sidebar_list")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         if self.list_keys.is_empty() {
@@ -550,42 +653,39 @@ impl BaoGuiApp {
                         let mut clicked: Option<String> = None;
                         for key in &self.list_keys {
                             let is_folder = key.ends_with('/');
-                            let label = if is_folder {
-                                format!("📁  {key}")
-                            } else {
-                                format!("🔑  {key}")
-                            };
+                            let display = key.trim_end_matches('/').to_string();
                             let selected = !is_folder
-                                && self.current_path.ends_with(key.as_str())
-                                && (self.folder.is_empty()
-                                    || self.current_path.starts_with(&self.folder));
+                                && (self.current_path == *key
+                                    || self.current_path.ends_with(&format!("/{key}"))
+                                    || self.current_path == display);
 
-                            let resp = ui
-                                .add(
-                                    egui::Button::new(
-                                        RichText::new(label)
-                                            .size(th.type_scale.body)
-                                            .color(if selected {
-                                                th.palette.accent
-                                            } else {
-                                                th.palette.text
-                                            }),
-                                    )
-                                    .fill(if selected {
-                                        th.palette.accent.gamma_multiply(0.2)
-                                    } else {
-                                        Color32::TRANSPARENT
-                                    })
-                                    .stroke(egui::Stroke::NONE)
-                                    .min_size(Vec2::new(ui.available_width(), th.spacing.control_height))
-                                    .sense(Sense::click()),
-                                );
+                            let row_w = ui.available_width().max(1.0);
+                            let text = if is_folder {
+                                format!("▸  {display}")
+                            } else {
+                                display.clone()
+                            };
+                            let resp = ui.add_sized(
+                                [row_w, th.spacing.control_height],
+                                egui::SelectableLabel::new(
+                                    selected,
+                                    RichText::new(text)
+                                        .size(th.type_scale.body)
+                                        .monospace()
+                                        .color(if selected {
+                                            th.palette.accent
+                                        } else {
+                                            th.palette.text
+                                        }),
+                                ),
+                            );
                             if resp.clicked() {
                                 clicked = Some(key.clone());
                             }
                         }
                         if let Some(name) = clicked {
-                            self.open_list_item(&name);
+                            self.pending_open = Some(name);
+                            ui.ctx().request_repaint();
                         }
                     });
             });
@@ -595,7 +695,7 @@ impl BaoGuiApp {
             .show(ctx, |ui| {
                 if !self.show_detail {
                     ui.vertical_centered(|ui| {
-                        ui.add_space(ui.available_height() * 0.25);
+                        ui.add_space(ui.available_height() * 0.28);
                         title(ui, th, "No secret selected");
                         dim_label(
                             ui,
@@ -606,106 +706,160 @@ impl BaoGuiApp {
                     return;
                 }
 
+                // ── Header ──────────────────────────────────────────
                 ui.horizontal(|ui| {
-                    ui.add(
-                        TextEdit::singleline(&mut self.path_display)
-                            .interactive(false)
-                            .margin(th.text_edit_margin())
-                            .desired_width(ui.available_width() - 90.0)
-                            .font(egui::TextStyle::Monospace),
-                    );
-                    if button(ui, th, "Copy").clicked() {
-                        ctx.copy_text(self.path_display.clone());
-                        self.show_toast("Path copied");
-                    }
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new(&self.path_display)
+                                .size(th.type_scale.title_2)
+                                .strong()
+                                .color(th.palette.text)
+                                .monospace(),
+                        );
+                        if !self.meta.is_empty() {
+                            dim_label(ui, th, &self.meta);
+                        }
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if icon_button(ui, th, Icon::Copy, "Copy path").clicked() {
+                            ctx.copy_text(self.path_display.clone());
+                            self.show_toast("Path copied");
+                        }
+                    });
                 });
 
-                if !self.meta.is_empty() {
-                    dim_label(ui, th, &self.meta);
-                }
-
-                ui.add_space(th.spacing.sm);
+                ui.add_space(th.spacing.md);
+                let mut reveal_clicked = false;
+                let mut delete_clicked = false;
+                let mut save_clicked = false;
+                let mut add_key = false;
+                let reveal_label = if self.reveal_values {
+                    "Hide values"
+                } else {
+                    "Show values"
+                };
                 ui.horizontal(|ui| {
-                    let label = if self.reveal_values {
-                        "Hide values"
-                    } else {
-                        "Show values"
-                    };
-                    if button(ui, th, label).clicked() {
-                        self.reveal_values = !self.reveal_values;
+                    if button(ui, th, reveal_label).clicked() {
+                        reveal_clicked = true;
+                    }
+                    if button(ui, th, "Add key").clicked() {
+                        add_key = true;
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if destructive_button(ui, th, "Delete").clicked() {
-                            self.delete_confirm = true;
+                            delete_clicked = true;
                         }
                         if primary_button(ui, th, "Save").clicked() {
-                            self.save_secret();
+                            save_clicked = true;
                         }
                     });
                 });
+                if reveal_clicked {
+                    self.reveal_values = !self.reveal_values;
+                }
+                if add_key {
+                    self.kv_rows.push(KvRow {
+                        key: String::new(),
+                        value: String::new(),
+                    });
+                }
+                if save_clicked {
+                    self.save_secret();
+                }
+                if delete_clicked {
+                    self.delete_confirm = true;
+                }
 
-                ui.add_space(th.spacing.sm);
+                ui.add_space(th.spacing.md);
                 ui.separator();
                 ui.add_space(th.spacing.sm);
 
+                if self.kv_rows.is_empty() {
+                    dim_label(ui, th, "No key/value pairs in this secret.");
+                    return;
+                }
+
+                // Column headers
+                let full_w = ui.available_width().max(1.0);
+                let ctrl_h = th.spacing.control_height;
+                let act_w = ctrl_h * 2.0 + th.spacing.sm; // copy icon + remove
+                let key_w = (full_w * 0.32).clamp(140.0, 280.0);
+                let val_w = (full_w - key_w - act_w - th.spacing.md).max(80.0);
+                let row_h = ctrl_h + 4.0;
+
+                ui.horizontal(|ui| {
+                    ui.add_space(4.0);
+                    ui.add_sized(
+                        [key_w, 16.0],
+                        egui::Label::new(
+                            RichText::new("Key")
+                                .size(th.type_scale.caption)
+                                .color(th.palette.text_secondary),
+                        ),
+                    );
+                    ui.add_sized(
+                        [val_w, 16.0],
+                        egui::Label::new(
+                            RichText::new("Value")
+                                .size(th.type_scale.caption)
+                                .color(th.palette.text_secondary),
+                        ),
+                    );
+                });
+                ui.add_space(th.spacing.xs);
+
+                let n = self.kv_rows.len();
+                let reveal = self.reveal_values;
+                let mut remove_idx: Option<usize> = None;
+                let mut copy_val: Option<String> = None;
+
                 ScrollArea::vertical()
+                    .id_salt("kv_list")
                     .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        if self.kv_rows.is_empty() {
-                            dim_label(ui, th, "No key/value pairs");
-                        }
-
-                        let mut remove_idx: Option<usize> = None;
-                        let mut copy_val: Option<String> = None;
-                        let reveal = self.reveal_values;
-
-                        for (i, row) in self.kv_rows.iter_mut().enumerate() {
-                            th.card_frame().show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.add(
-                                        TextEdit::singleline(&mut row.key)
-                                            .margin(th.text_edit_margin())
-                                            .desired_width(140.0)
-                                            .font(egui::TextStyle::Monospace)
-                                            .hint_text("key"),
-                                    );
-                                    ui.add(
-                                        TextEdit::singleline(&mut row.value)
-                                            .password(!reveal)
-                                            .margin(th.text_edit_margin())
-                                            .desired_width(
-                                                (ui.available_width() - 120.0).max(80.0),
-                                            )
-                                            .font(egui::TextStyle::Monospace)
-                                            .hint_text("value"),
-                                    );
-                                    if button(ui, th, "Copy").clicked() {
-                                        copy_val = Some(row.value.clone());
-                                    }
-                                    if button(ui, th, "✕").clicked() {
-                                        remove_idx = Some(i);
-                                    }
-                                });
-                            });
-                            ui.add_space(th.spacing.xs);
-                        }
-
-                        if let Some(i) = remove_idx {
-                            self.kv_rows.remove(i);
-                        }
-                        if let Some(v) = copy_val {
-                            ctx.copy_text(v);
-                            self.show_toast("Value copied");
-                        }
-
-                        ui.add_space(th.spacing.sm);
-                        if button(ui, th, "Add key").clicked() {
-                            self.kv_rows.push(KvRow {
-                                key: String::new(),
-                                value: String::new(),
+                    .show_rows(ui, row_h, n, |ui, row_range| {
+                        for i in row_range {
+                            let row = &mut self.kv_rows[i];
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = th.spacing.sm;
+                                ui.set_height(row_h);
+                                ui.add_sized(
+                                    [key_w, ctrl_h],
+                                    TextEdit::singleline(&mut row.key)
+                                        .id_salt(("k", i))
+                                        .font(egui::TextStyle::Monospace)
+                                        .hint_text("key")
+                                        .margin(th.text_edit_margin()),
+                                );
+                                ui.add_sized(
+                                    [val_w, ctrl_h],
+                                    TextEdit::singleline(&mut row.value)
+                                        .id_salt(("v", i))
+                                        .password(!reveal)
+                                        .font(egui::TextStyle::Monospace)
+                                        .hint_text("value")
+                                        .margin(th.text_edit_margin()),
+                                );
+                                if icon_button(ui, th, Icon::Copy, "Copy value").clicked() {
+                                    copy_val = Some(row.value.clone());
+                                }
+                                if ui
+                                    .add_sized([ctrl_h, ctrl_h], egui::Button::new("×"))
+                                    .on_hover_text("Remove key")
+                                    .clicked()
+                                {
+                                    remove_idx = Some(i);
+                                }
                             });
                         }
                     });
+
+                if let Some(i) = remove_idx {
+                    self.kv_rows.remove(i);
+                }
+                if let Some(v) = copy_val {
+                    ctx.copy_text(v);
+                    self.show_toast("Value copied");
+                }
             });
     }
 
@@ -809,7 +963,7 @@ impl BaoGuiApp {
             .show(ctx, |ui| {
                 egui::Frame::new()
                     .fill(th.palette.popover_bg)
-                    .stroke(egui::Stroke::new(1.0, th.palette.border))
+                    .stroke(egui::Stroke::new(1.0_f32, th.palette.border))
                     .corner_radius(th.spacing.radius_md)
                     .inner_margin(egui::Margin::symmetric(
                         th.spacing.lg as i8,
@@ -847,4 +1001,34 @@ fn parse_kv_lines(text: &str) -> BTreeMap<String, String> {
         }
     }
     map
+}
+
+/// Prefer env tokens, then common token files (`~/.vault-token`, `~/.bao-token`).
+fn load_stored_token() -> String {
+    if let Ok(t) = std::env::var("BAO_TOKEN").or_else(|_| std::env::var("VAULT_TOKEN")) {
+        let t = t.trim().to_string();
+        if !t.is_empty() {
+            return t;
+        }
+    }
+
+    let home = std::env::var("HOME").ok();
+    let candidates: Vec<std::path::PathBuf> = [
+        std::env::var("BAO_TOKEN_PATH").ok().map(std::path::PathBuf::from),
+        home.as_ref().map(|h| std::path::PathBuf::from(h).join(".vault-token")),
+        home.as_ref().map(|h| std::path::PathBuf::from(h).join(".bao-token")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    for path in candidates {
+        if let Ok(s) = std::fs::read_to_string(&path) {
+            let t = s.trim().to_string();
+            if !t.is_empty() {
+                return t;
+            }
+        }
+    }
+    String::new()
 }

@@ -3,12 +3,16 @@ Type=Application
 Version=1.5
 Name=BaoGUI
 GenericName=OpenBao Client
-Comment=Simple Vidya client for OpenBao secrets
+Comment=Simple Vidya / egui client for OpenBao secrets
+# Packaged installs: wrapped binary on PATH. Dev `nix run` rewrites Exec and
+# stages this file under target/xdg-data/ so Wayland can match app_id → icon.
 Exec=baogui
 Icon=org.openbao.baogui
 Terminal=false
 Categories=Utility;Security;Network;
-Keywords=OpenBao;Vault;secrets;password;KV;
+Keywords=OpenBao;Vault;secrets;password;KV;BaoGUI;
 StartupNotify=true
-StartupWMClass=baogui
+# Must match ViewportBuilder::with_app_id / run_native id (org.openbao.baogui).
+StartupWMClass=org.openbao.baogui
 DBusActivatable=false
+SingleMainWindow=true

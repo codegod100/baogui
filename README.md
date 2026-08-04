@@ -10,7 +10,7 @@ This is a port of [BaoGTK](../baogtk) with the same OpenBao API surface, rebuilt
 
 ## Features
 
-- Connect with server URL + token (`BAO_ADDR` / `BAO_TOKEN` / `~/.vault-token` prefilled)
+- Auto-connect with stored token (`BAO_TOKEN` / `~/.vault-token` / `~/.bao-token`); token field only appears if that fails
 - Auto-detect KV mount (prefers `secret/`)
 - Browse folders and secrets
 - Read, create, edit, and permanently delete KV v2 secrets
@@ -20,19 +20,20 @@ This is a port of [BaoGTK](../baogtk) with the same OpenBao API surface, rebuilt
 ## Run
 
 ```bash
-nix run                 # apps.default → baogui
-nix run .#baogui
+nix run                 # apps.default → cargo run (host rustup)
+nix run .#baogui        # same
 ```
 
-### Local cargo (sibling `../vidya`)
+Uses **PATH** `cargo`/`rustc` (rustup), sets egui GL/Wayland `LD_LIBRARY_PATH`, stages FreeDesktop icons + `.desktop` under `target/xdg-data/` for Wayland app_id, then **`cargo run`**. Does not download nixpkgs rustc. Needs sibling `../vidya`.
+
+Desktop entry source: `data/share/applications/org.openbao.baogui.desktop`.
+
+### Other entry points
 
 ```bash
-nix develop
-cargo run --release
-
-# or packaged build without enter:
-nix run .#build
-./target/release/baogui
+nix run .#build         # cargo build (pass -- --release if you want)
+nix develop             # egui libs + helpers; host rustc → cargo run
+nix build .#baogui      # pure package (binary + .desktop + icons)
 ```
 
 ## Usage
@@ -60,12 +61,12 @@ nix run .#build
 
 | Output | Role |
 |--------|------|
-| `apps.default` / `apps.baogui` | Launch the window (packaged derivation) |
-| `apps.build` | `cargo build --release` via devshell tools |
-| `packages.default` / `packages.baogui` | Wrapped binary (`LD_LIBRARY_PATH` for GL/Wayland) |
-| `devShells.default` | rustc + cargo + egui runtime libs |
+| `apps.default` / `apps.baogui` | Stage `.desktop`/icons, `cargo run` (host rustup) |
+| `apps.build` | `cargo build` only (host rustup) |
+| `packages.default` / `packages.baogui` | Pure wrapped binary + desktop entry + icons |
+| `devShells.default` | egui runtime libs + pkg-config/glib (host rustc) |
 
-Flake input `vidya` is staged beside the crate so `path = "../vidya"` resolves under `nix build` / `nix run`.
+Flake input `vidya` is staged for `nix build` only. Day-to-day `nix run` needs sibling `../vidya` for the Cargo path dep.
 
 ## License
 

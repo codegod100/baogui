@@ -178,12 +178,13 @@ impl Client {
             )
         };
 
-        // OpenBao/Vault accept LIST or GET ?list=true
-        let value = match self.send(self.request(reqwest::Method::from_bytes(b"LIST").unwrap(), &api_path))
-        {
+        // OpenBao/Vault accept LIST or GET ?list=true. Prefer LIST; fall back on
+        // 404/405 *or* an empty keys array with a successful alternate form.
+        let value = match self.send(
+            self.request(reqwest::Method::from_bytes(b"LIST").unwrap(), &api_path),
+        ) {
             Ok(v) => v,
             Err(ApiError::Status { code, .. }) if code == 404 || code == 405 => {
-                // Empty folder or method not allowed — try query form
                 let builder = self
                     .request(reqwest::Method::GET, &api_path)
                     .query(&[("list", "true")]);
@@ -196,16 +197,7 @@ impl Client {
             Err(e) => return Err(e),
         };
 
-        let keys = value
-            .pointer("/data/keys")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|k| k.as_str().map(|s| s.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok(keys)
+        Ok(extract_list_keys(&value))
     }
 
     pub fn read_secret(&self, mount: &str, path: &str) -> Result<SecretData, ApiError> {
@@ -299,6 +291,26 @@ fn value_to_string(v: &Value) -> String {
     }
 }
 
+fn extract_list_keys(value: &Value) -> Vec<String> {
+    // Standard: { "data": { "keys": ["a", "b/"] } }
+    // Some proxies flatten one level; accept a few shapes.
+    let arr = value
+        .pointer("/data/keys")
+        .or_else(|| value.pointer("/keys"))
+        .and_then(|v| v.as_array());
+
+    let mut keys: Vec<String> = arr
+        .map(|a| {
+            a.iter()
+                .filter_map(|k| k.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
 fn extract_error_message(body: &str) -> Option<String> {
     let value: Value = serde_json::from_str(body).ok()?;
     if let Some(errors) = value.get("errors").and_then(|e| e.as_array()) {
@@ -311,4 +323,78 @@ fn extract_error_message(body: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn extract_list_keys_standard() {
+        let v = json!({"data": {"keys": ["ai-api-keys", "foo/"]}});
+        assert_eq!(
+            extract_list_keys(&v),
+            vec!["ai-api-keys".to_string(), "foo/".to_string()]
+        );
+    }
+
+    #[test]
+    fn secret_data_pointer_shape() {
+        let value = json!({
+            "data": {
+                "data": {
+                    "ANNA_API_KEY": "x",
+                    "ATLAS_API_KEY": "y"
+                },
+                "metadata": {
+                    "version": 22,
+                    "created_time": "2026-07-31T00:00:00Z"
+                }
+            }
+        });
+        let data_map = value
+            .pointer("/data/data")
+            .and_then(|v| v.as_object())
+            .unwrap();
+        assert_eq!(data_map.len(), 2);
+        assert!(data_map.contains_key("ANNA_API_KEY"));
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+
+    /// `BAO_ADDR` + token required. Run: `cargo test live_read -- --ignored --nocapture`
+    #[test]
+    #[ignore = "live OpenBao network"]
+    fn live_read_ai_api_keys() {
+        let addr = std::env::var("BAO_ADDR").unwrap_or_else(|_| "https://openbao.boxd.sh".into());
+        let token = std::env::var("BAO_TOKEN").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap();
+            std::fs::read_to_string(format!("{home}/.vault-token"))
+                .expect("token")
+                .trim()
+                .to_string()
+        });
+        let c = Client::new(&addr, &token).unwrap();
+        let keys = c.list_secrets("secret", "").expect("list");
+        assert!(
+            keys.iter().any(|k| k.trim_end_matches('/') == "ai-api-keys"),
+            "keys={keys:?}"
+        );
+        let s = c.read_secret("secret", "ai-api-keys").expect("read");
+        assert!(
+            s.data.len() >= 5,
+            "expected many fields, got {} {:?}",
+            s.data.len(),
+            s.data.keys().collect::<Vec<_>>()
+        );
+        eprintln!(
+            "OK {} fields: {:?}",
+            s.data.len(),
+            s.data.keys().collect::<Vec<_>>()
+        );
+    }
 }

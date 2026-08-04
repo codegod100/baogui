@@ -25,12 +25,11 @@ This repo is colocated with git (`.jj` + `.git`); remotes still go through the g
 ## Dev
 
 ```bash
-nix develop
-cargo run
-# or
-nix run
+nix run                 # cargo run (host rustup + staged .desktop/icons)
+nix develop             # interactive → cargo run (egui libs; host rustc)
+nix build .#baogui      # pure package (stages flake input vidya)
 ```
 
-Requires sibling `../vidya` for local cargo path dep. Packaged `nix build` / `nix run` stage vidya from the flake input.
+`nix run` / `nix run .#baogui` use **PATH** `cargo`/`rustc` (rustup), set egui `LD_LIBRARY_PATH`, stage FreeDesktop data under `target/xdg-data/`, and **`cargo run`**. They do **not** pull nixpkgs rustc. Needs sibling `../vidya`. Packaged `nix build .#baogui` stages vidya from the flake input and installs the desktop entry under `$out/share/applications/`.
 
 App id / desktop icon: `org.openbao.baogui`.
