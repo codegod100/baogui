@@ -150,6 +150,11 @@ pub fn start_oidc_login(config: OidcLoginConfig) -> Result<OidcLogin, String> {
         config.listen_port
     };
 
+    // Build the HTTP client on the calling (UI) thread. Creating a reqwest
+    // blocking client (and its Tokio runtime) from the callback thread is
+    // unreliable on Android after the app has been backgrounded for browser login.
+    let http = build_http_client()?;
+
     let listen_addr = format!("127.0.0.1:{port}");
     let listener = TcpListener::bind(&listen_addr)
         .map_err(|e| format!("OIDC callback listen on {listen_addr} failed: {e}"))?;
@@ -160,13 +165,15 @@ pub fn start_oidc_login(config: OidcLoginConfig) -> Result<OidcLogin, String> {
     let redirect_uri = format!("http://localhost:{port}/oidc/callback");
     let client_nonce = random_nonce();
 
-    let auth_url = request_auth_url(&address, &mount, &role, &redirect_uri, &client_nonce)?;
+    let auth_url =
+        request_auth_url(&http, &address, &mount, &role, &redirect_uri, &client_nonce)?;
     let browser_error = open_browser(&auth_url).err();
 
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_bg = Arc::clone(&cancel);
     let wake_addr = listen_addr.clone();
+    let http_bg = http.clone();
 
     let _ = tx.send(OidcLoginEvent::Ready {
         auth_url: auth_url.clone(),
@@ -176,6 +183,7 @@ pub fn start_oidc_login(config: OidcLoginConfig) -> Result<OidcLogin, String> {
     thread::spawn(move || {
         run_login_thread(
             listener,
+            http_bg,
             address,
             mount,
             client_nonce,
@@ -192,8 +200,54 @@ pub fn start_oidc_login(config: OidcLoginConfig) -> Result<OidcLogin, String> {
     })
 }
 
+fn build_http_client() -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .connect_timeout(Duration::from_secs(20))
+        // Avoid HTTP/2 edge cases with long OIDC query strings on some stacks.
+        .http1_only()
+        // Browser login can take minutes; a pooled keep-alive to OpenBao is often
+        // already closed by the LB and then fails with a vague "error sending request".
+        .pool_max_idle_per_host(0)
+        .build()
+        .map_err(|e| format!("HTTP client setup failed: {e}"))
+}
+
+fn format_reqwest_error(context: &str, err: reqwest::Error) -> String {
+    // Put the root cause first — the URL is huge and used to bury TLS/connect details.
+    let url = err
+        .url()
+        .map(|u| {
+            let s = u.as_str();
+            if s.len() > 96 {
+                format!("{}…", &s[..96])
+            } else {
+                s.to_string()
+            }
+        })
+        .unwrap_or_default();
+    let mut parts = Vec::new();
+    let mut src = std::error::Error::source(&err);
+    while let Some(cause) = src {
+        parts.push(cause.to_string());
+        src = cause.source();
+    }
+    let cause = if parts.is_empty() {
+        err.without_url().to_string()
+    } else {
+        parts.join(" → ")
+    };
+    if url.is_empty() {
+        format!("{context}: {cause}")
+    } else {
+        format!("{context}: {cause} ({url})")
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_login_thread(
     listener: TcpListener,
+    http: reqwest::blocking::Client,
     address: String,
     mount: String,
     client_nonce: String,
@@ -220,7 +274,13 @@ fn run_login_thread(
                     let _ = tx.send(OidcLoginEvent::Failed("OIDC login cancelled.".into()));
                     return;
                 }
-                match handle_callback_connection(stream, &address, &mount, &client_nonce) {
+                match handle_callback_connection(
+                    stream,
+                    &http,
+                    &address,
+                    &mount,
+                    &client_nonce,
+                ) {
                     Ok(token) => {
                         let _ = tx.send(OidcLoginEvent::Success { token });
                         return;
@@ -251,6 +311,7 @@ enum CallbackConnError {
 
 fn handle_callback_connection(
     mut stream: TcpStream,
+    http: &reqwest::blocking::Client,
     address: &str,
     mount: &str,
     client_nonce: &str,
@@ -284,7 +345,7 @@ fn handle_callback_connection(
                 params.insert(k, v);
             }
             // form_post mode: first POST code/id_token to OpenBao, then GET with state/code.
-            if let Err(e) = oidc_callback_form_post(address, mount, &params, client_nonce) {
+            if let Err(e) = oidc_callback_form_post(http, address, mount, &params, client_nonce) {
                 let html = error_html("Login failed", &e);
                 let _ = write_http_response(
                     &mut stream,
@@ -339,7 +400,9 @@ fn handle_callback_connection(
         ));
     }
 
-    match oidc_callback_exchange(address, mount, &state, &code, client_nonce) {
+    // Exchange with OpenBao before answering the browser so a Chrome retry cannot
+    // consume the authorization code twice. Keep the localhost socket open meanwhile.
+    match oidc_callback_exchange(http, address, mount, &state, &code, client_nonce) {
         Ok(token) => {
             let _ = write_http_response(
                 &mut stream,
@@ -445,17 +508,13 @@ fn urlencoding_decode(s: &str) -> Result<String, ()> {
 }
 
 fn request_auth_url(
+    http: &reqwest::blocking::Client,
     address: &str,
     mount: &str,
     role: &str,
     redirect_uri: &str,
     client_nonce: &str,
 ) -> Result<String, String> {
-    let http = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|e| e.to_string())?;
-
     let url = format!("{address}/v1/auth/{mount}/oidc/auth_url");
     let mut body = json!({
         "redirect_uri": redirect_uri,
@@ -470,7 +529,7 @@ fn request_auth_url(
         .header("X-Vault-Request", "true")
         .json(&body)
         .send()
-        .map_err(|e| format!("auth_url request failed: {e}"))?;
+        .map_err(|e| format_reqwest_error("OIDC auth_url request failed", e))?;
     let status = response.status();
     let text = response.text().unwrap_or_default();
     if !status.is_success() {
@@ -499,16 +558,12 @@ fn request_auth_url(
 }
 
 fn oidc_callback_form_post(
+    http: &reqwest::blocking::Client,
     address: &str,
     mount: &str,
     params: &std::collections::BTreeMap<String, String>,
     client_nonce: &str,
 ) -> Result<(), String> {
-    let http = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|e| e.to_string())?;
-
     let url = format!("{address}/v1/auth/{mount}/oidc/callback");
     let mut pairs = vec![("client_nonce", client_nonce.to_string())];
     for key in ["state", "code", "id_token"] {
@@ -524,7 +579,7 @@ fn oidc_callback_form_post(
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(body)
         .send()
-        .map_err(|e| format!("OIDC form_post failed: {e}"))?;
+        .map_err(|e| format_reqwest_error("OIDC form_post failed", e))?;
     if !response.status().is_success() {
         let text = response.text().unwrap_or_default();
         return Err(extract_errors(&text).unwrap_or_else(|| {
@@ -535,46 +590,57 @@ fn oidc_callback_form_post(
 }
 
 fn oidc_callback_exchange(
+    http: &reqwest::blocking::Client,
     address: &str,
     mount: &str,
     state: &str,
     code: &str,
     client_nonce: &str,
 ) -> Result<String, String> {
-    let http = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|e| e.to_string())?;
-
     let url = format!("{address}/v1/auth/{mount}/oidc/callback");
-    let response = http
-        .get(&url)
-        .header("X-Vault-Request", "true")
-        .query(&[
-            ("state", state),
-            ("code", code),
-            ("client_nonce", client_nonce),
-        ])
-        .send()
-        .map_err(|e| format!("OIDC callback failed: {e}"))?;
-    let status = response.status();
-    let text = response.text().unwrap_or_default();
-    if !status.is_success() {
-        return Err(format!(
-            "OIDC callback failed (HTTP {}): {}",
-            status.as_u16(),
-            extract_errors(&text).unwrap_or(text.chars().take(300).collect())
-        ));
-    }
+    let mut last_err = None;
+    // One retry covers transient connect resets after the app returns from the browser.
+    for attempt in 0..2 {
+        let response = match http
+            .get(&url)
+            .header("X-Vault-Request", "true")
+            .query(&[
+                ("state", state),
+                ("code", code),
+                ("client_nonce", client_nonce),
+            ])
+            .send()
+        {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = Some(format_reqwest_error("OIDC callback failed", e));
+                if attempt == 0 {
+                    thread::sleep(Duration::from_millis(250));
+                    continue;
+                }
+                break;
+            }
+        };
+        let status = response.status();
+        let text = response.text().unwrap_or_default();
+        if !status.is_success() {
+            return Err(format!(
+                "OIDC callback failed (HTTP {}): {}",
+                status.as_u16(),
+                extract_errors(&text).unwrap_or(text.chars().take(300).collect())
+            ));
+        }
 
-    let value: Value =
-        serde_json::from_str(&text).map_err(|e| format!("OIDC callback parse error: {e}"))?;
-    value
-        .pointer("/auth/client_token")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| "OIDC callback returned no client_token.".into())
+        let value: Value =
+            serde_json::from_str(&text).map_err(|e| format!("OIDC callback parse error: {e}"))?;
+        return value
+            .pointer("/auth/client_token")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "OIDC callback returned no client_token.".into());
+    }
+    Err(last_err.unwrap_or_else(|| "OIDC callback failed.".into()))
 }
 
 fn encode_form(pairs: &[(&str, String)]) -> String {
@@ -681,7 +747,9 @@ mod tests {
             let _ = stream.write_all(resp.as_bytes());
         });
 
+        let http = build_http_client().unwrap();
         let token = oidc_callback_exchange(
+            &http,
             &format!("http://{addr}"),
             "oidc",
             "st",
@@ -708,7 +776,9 @@ mod tests {
             let _ = stream.write_all(resp.as_bytes());
         });
 
+        let http = build_http_client().unwrap();
         let url = request_auth_url(
+            &http,
             &format!("http://{addr}"),
             "oidc",
             "dev",
