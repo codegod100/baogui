@@ -752,4 +752,79 @@ mod tests {
         .unwrap();
         assert_eq!(url, "https://example.com/authorize?x=1");
     }
+
+    #[test]
+    fn full_login_callback_roundtrip() {
+        // Fake OpenBao: auth_url then callback → client_token.
+        let bao = TcpListener::bind("127.0.0.1:0").unwrap();
+        let bao_addr = bao.local_addr().unwrap();
+        thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = bao.accept().unwrap();
+                let mut buf = [0u8; 8192];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let body = if req.contains("auth_url") {
+                    r#"{"data":{"auth_url":"https://example.com/authorize?x=1"}}"#
+                } else {
+                    r#"{"auth":{"client_token":"s.oidc-token"}}"#
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+
+        // Pick a free local callback port.
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let login = start_oidc_login(OidcLoginConfig {
+            address: format!("http://{bao_addr}"),
+            mount: "oidc".into(),
+            role: "dev".into(),
+            listen_port: port,
+        })
+        .unwrap();
+
+        // Drain Ready.
+        let mut saw_ready = false;
+        for _ in 0..50 {
+            match login.try_recv() {
+                Some(OidcLoginEvent::Ready { .. }) => {
+                    saw_ready = true;
+                    break;
+                }
+                Some(OidcLoginEvent::Failed(e)) => panic!("unexpected fail before callback: {e}"),
+                Some(OidcLoginEvent::Success { .. }) => panic!("success too early"),
+                None => thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        assert!(saw_ready);
+
+        // Simulate IdP redirect to the local callback.
+        let mut client = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+        let req = "GET /oidc/callback?code=abc&state=xyz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        client.write_all(req.as_bytes()).unwrap();
+        let mut resp = String::new();
+        let _ = client.read_to_string(&mut resp);
+        assert!(resp.contains("Authentication successful"), "{resp}");
+
+        let mut token = None;
+        for _ in 0..50 {
+            match login.try_recv() {
+                Some(OidcLoginEvent::Success { token: t }) => {
+                    token = Some(t);
+                    break;
+                }
+                Some(OidcLoginEvent::Failed(e)) => panic!("login failed: {e}"),
+                Some(OidcLoginEvent::Ready { .. }) => {}
+                None => thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        assert_eq!(token.as_deref(), Some("s.oidc-token"));
+    }
 }
