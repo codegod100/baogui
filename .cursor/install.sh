@@ -28,22 +28,37 @@ load_nix_env() {
     . "$HOME/.nix-profile/etc/profile.d/nix.sh"
   fi
   export PATH="/nix/var/nix/profiles/default/bin:${HOME}/.nix-profile/bin:${PATH}"
-  if [[ -S "$SOCKET" ]]; then
+  if nix_daemon_ping; then
     export NIX_REMOTE=daemon
   else
     unset NIX_REMOTE || true
   fi
 }
 
+# True only when the daemon socket accepts connections (not merely exists).
+nix_daemon_ping() {
+  command -v nix >/dev/null 2>&1 || return 1
+  [[ -S "$SOCKET" ]] || return 1
+  NIX_REMOTE=daemon nix store ping --store daemon >/dev/null 2>&1
+}
+
 nix_store_ok() {
   command -v nix >/dev/null 2>&1 || return 1
-  if [[ -S "$SOCKET" ]]; then
+  if nix_daemon_ping; then
     export NIX_REMOTE=daemon
-    nix store ping --store daemon >/dev/null 2>&1
-    return $?
+    return 0
   fi
   unset NIX_REMOTE || true
   nix store ping --store local >/dev/null 2>&1 && [[ -w /nix/var/nix ]]
+}
+
+remove_stale_nix_socket() {
+  # --init none leaves a socket path after reboot/snapshot with no daemon.
+  if [[ -e "$SOCKET" ]] && ! nix_daemon_ping; then
+    log "removing stale nix daemon socket at $SOCKET"
+    run_root rm -f "$SOCKET"
+    unset NIX_REMOTE || true
+  fi
 }
 
 ensure_nix_flakes() {
@@ -82,10 +97,12 @@ ensure_nix_flakes() {
 }
 
 start_nix_daemon() {
-  if [[ -S "$SOCKET" ]]; then
+  if nix_daemon_ping; then
     export NIX_REMOTE=daemon
     return 0
   fi
+
+  remove_stale_nix_socket
 
   local bin="/nix/var/nix/profiles/default/bin/nix"
   if [[ ! -x "$bin" ]]; then
@@ -100,16 +117,28 @@ start_nix_daemon() {
 
   local i
   for i in $(seq 1 60); do
-    if [[ -S "$SOCKET" ]]; then
+    if nix_daemon_ping; then
       export NIX_REMOTE=daemon
-      log "nix daemon socket is up"
+      log "nix daemon is up"
       return 0
     fi
     sleep 0.25
   done
 
-  log "nix daemon did not create $SOCKET"
+  log "nix daemon did not become reachable at $SOCKET"
   return 1
+}
+
+# Used by environment.json `start` and manual recovery after reboot.
+ensure_nix_daemon_ready() {
+  load_nix_env
+  ensure_nix_flakes
+  if nix_store_ok; then
+    return 0
+  fi
+  start_nix_daemon || true
+  load_nix_env
+  nix_store_ok
 }
 
 install_determinate_nix() {
@@ -314,6 +343,15 @@ install_starship() {
   ensure_starship_shell_init
   log "starship ready ($(starship --version 2>&1 | head -1))"
 }
+
+if [[ "${1:-}" == "ensure-nix" ]]; then
+  if ensure_nix_daemon_ready; then
+    log "nix daemon ready ($(nix --version 2>/dev/null | head -1))"
+    exit 0
+  fi
+  log "nix store is not reachable"
+  exit 1
+fi
 
 install_determinate_nix
 ensure_vidya_sibling
