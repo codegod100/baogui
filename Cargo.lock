@@ -145,6 +145,7 @@ dependencies = [
  "serde_json",
  "url",
  "vidya",
+ "webbrowser",
 ]
 
 [[package]]

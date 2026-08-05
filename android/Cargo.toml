@@ -51,3 +51,5 @@ target_sdk_version = 34
 [package.metadata.android.application]
 label = "BaoGUI"
 orientations = ["Portrait", "Landscape"]
+# HTTP OpenBao servers + localhost OIDC callback (http://localhost:8250/…).
+uses_cleartext_traffic = true

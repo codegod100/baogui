@@ -14,7 +14,6 @@ use vidya::{
 use vidya::reserve_system_chrome;
 
 use crate::api::{Client, SearchIndex, SearchMatch, SecretData};
-#[cfg(not(target_os = "android"))]
 use crate::oidc::{start_oidc_login, OidcLogin, OidcLoginConfig, OidcLoginEvent};
 
 const TOAST_SECS: u64 = 3;
@@ -30,7 +29,6 @@ enum Screen {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AuthMethod {
     Token,
-    #[cfg(not(target_os = "android"))]
     Oidc,
 }
 
@@ -75,13 +73,9 @@ pub struct BaoGuiApp {
     address: String,
     token: String,
     auth_method: AuthMethod,
-    #[cfg(not(target_os = "android"))]
     oidc_mount: String,
-    #[cfg(not(target_os = "android"))]
     oidc_role: String,
-    #[cfg(not(target_os = "android"))]
     oidc_login: Option<OidcLogin>,
-    #[cfg(not(target_os = "android"))]
     oidc_auth_url: String,
     connect_status: String,
     /// When false, a stored token is used and the token field is hidden.
@@ -139,7 +133,6 @@ impl BaoGuiApp {
 
         let token = load_stored_token();
         let has_stored = !token.is_empty();
-        #[cfg(not(target_os = "android"))]
         let oidc_defaults = OidcLoginConfig::from_env_defaults();
 
         Self {
@@ -147,13 +140,9 @@ impl BaoGuiApp {
             address,
             token,
             auth_method: AuthMethod::Token,
-            #[cfg(not(target_os = "android"))]
             oidc_mount: oidc_defaults.mount,
-            #[cfg(not(target_os = "android"))]
             oidc_role: oidc_defaults.role,
-            #[cfg(not(target_os = "android"))]
             oidc_login: None,
-            #[cfg(not(target_os = "android"))]
             oidc_auth_url: String::new(),
             connect_status: if has_stored {
                 "Connecting with stored token…".into()
@@ -281,7 +270,6 @@ impl BaoGuiApp {
         }
     }
 
-    #[cfg(not(target_os = "android"))]
     fn cancel_oidc_login(&mut self) {
         if let Some(login) = self.oidc_login.take() {
             login.cancel();
@@ -289,7 +277,6 @@ impl BaoGuiApp {
         self.oidc_auth_url.clear();
     }
 
-    #[cfg(not(target_os = "android"))]
     fn start_oidc(&mut self) {
         let addr = self.address.trim().to_string();
         if addr.is_empty() {
@@ -314,7 +301,6 @@ impl BaoGuiApp {
         }
     }
 
-    #[cfg(not(target_os = "android"))]
     fn poll_oidc_login(&mut self, ctx: &egui::Context) {
         let Some(login) = &self.oidc_login else {
             return;
@@ -333,7 +319,7 @@ impl BaoGuiApp {
                 self.connect_status = if let Some(err) = browser_error {
                     format!("Could not open browser ({err}). Open the URL below.")
                 } else {
-                    "Complete login in your browser…".into()
+                    "Complete login in your browser, then return here…".into()
                 };
                 ctx.request_repaint_after(Duration::from_millis(100));
             }
@@ -355,7 +341,6 @@ impl BaoGuiApp {
     }
 
     fn disconnect(&mut self) {
-        #[cfg(not(target_os = "android"))]
         self.cancel_oidc_login();
         self.client = None;
         self.folder.clear();
@@ -772,7 +757,6 @@ impl eframe::App for BaoGuiApp {
             }
         }
 
-        #[cfg(not(target_os = "android"))]
         if self.screen == Screen::Connect && self.oidc_login.is_some() {
             self.poll_oidc_login(ctx);
         }
@@ -837,12 +821,10 @@ impl BaoGuiApp {
                                 )
                                 .clicked()
                             {
-                                #[cfg(not(target_os = "android"))]
                                 self.cancel_oidc_login();
                                 self.auth_method = AuthMethod::Token;
                                 self.connect_status.clear();
                             }
-                            #[cfg(not(target_os = "android"))]
                             if ui
                                 .selectable_label(self.auth_method == AuthMethod::Oidc, "OIDC")
                                 .clicked()
@@ -877,7 +859,6 @@ impl BaoGuiApp {
                                     }
                                 }
                             }
-                            #[cfg(not(target_os = "android"))]
                             AuthMethod::Oidc => {
                                 ui.add_space(th.spacing.md);
                                 dim_label(ui, th, "OIDC mount");
@@ -903,10 +884,7 @@ impl BaoGuiApp {
                     });
 
                     ui.add_space(th.spacing.lg);
-                    #[cfg(not(target_os = "android"))]
                     let oidc_busy = self.oidc_login.is_some();
-                    #[cfg(target_os = "android")]
-                    let oidc_busy = false;
 
                     match self.auth_method {
                         AuthMethod::Token => {
@@ -919,7 +897,6 @@ impl BaoGuiApp {
                                 self.connect();
                             }
                         }
-                        #[cfg(not(target_os = "android"))]
                         AuthMethod::Oidc => {
                             if oidc_busy {
                                 if button(ui, th, "Cancel OIDC").clicked() {
