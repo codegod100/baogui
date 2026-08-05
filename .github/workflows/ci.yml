@@ -1,8 +1,8 @@
-# CI: host checks (always) + optional nixbuild APK on main / when secrets are set.
+# CI: host checks + nixbuild.net APK build when credentials are set.
 # APK: nix build .#android → baogui.apk → workflow artifact + summary link.
 #
-# NIXBUILD_TOKEN is fetched from OpenBao (secret/data/ai-api-keys). Falls back to
-# the repository secret nixbuild_token when OPENBAO_TOKEN is unset.
+# nixbuild.net: https://github.com/marketplace/actions/nixbuild-net
+# Set repository secret nixbuild_token (or OPENBAO_TOKEN → NIXBUILD_TOKEN in OpenBao).
 
 name: Build
 
@@ -47,6 +47,7 @@ jobs:
   apk:
     name: APK (android)
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     outputs:
       built: ${{ steps.creds.outputs.has_token }}
     steps:
@@ -94,7 +95,7 @@ jobs:
             accept-flake-config = true
             experimental-features = nix-command flakes
 
-      - uses: nixbuild/nixbuild-action@v25
+      - uses: nixbuild/nixbuild-action@v26
         if: steps.creds.outputs.has_token == 'true'
         with:
           nixbuild_token: ${{ env.NIXBUILD_TOKEN }}
