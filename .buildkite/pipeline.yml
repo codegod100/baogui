@@ -1,0 +1,38 @@
+# Buildkite CI for Radicle Garden (buildkite-adapter).
+# Mirrors .github/workflows/ci.yml "check" job. Agents must reach
+# https://nandi.radicle.garden/{rid}.git and https://tangled.org/nandi.uk/vidya.
+
+env:
+  RUST_BACKTRACE: "1"
+
+steps:
+  - label: ":rust: Check"
+    key: check
+    command: |
+      set -euo pipefail
+
+      # Path dep: vidya lives next to this checkout.
+      vidya_dir="$(dirname "$PWD")/vidya"
+      if [[ ! -d "$vidya_dir/.git" && ! -f "$vidya_dir/Cargo.toml" ]]; then
+        git clone --depth 1 https://tangled.org/nandi.uk/vidya "$vidya_dir"
+      fi
+
+      if ! command -v rustup >/dev/null 2>&1; then
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+          | sh -s -- -y --default-toolchain 1.85
+        # shellcheck disable=SC1091
+        source "$HOME/.cargo/env"
+      fi
+      rustup toolchain install 1.85 --profile minimal --component clippy
+      rustup default 1.85
+
+      if command -v apt-get >/dev/null 2>&1; then
+        sudo apt-get update
+        sudo apt-get install -y \
+          libxkbcommon-dev libxkbcommon-x11-dev \
+          libwayland-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev \
+          libgl1-mesa-dev libegl1-mesa-dev libvulkan-dev pkg-config
+      fi
+
+      cargo clippy -- -D warnings
+      cargo test
