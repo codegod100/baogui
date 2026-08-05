@@ -1,0 +1,12 @@
+{
+  "initialized": true,
+  "sealed": false,
+  "standby": false,
+  "performance_standby": false,
+  "replication_performance_mode": "disabled",
+  "replication_dr_mode": "disabled",
+  "server_time_utc": 1754000000,
+  "version": "2.2.0",
+  "cluster_name": "baogui-fixture",
+  "cluster_id": "00000000-0000-0000-0000-000000000001"
+}

@@ -71,6 +71,16 @@ http://localhost:8250/oidc/callback
 
 In BaoGUI (desktop or APK), choose **OIDC**, set the mount/role if needed, then **Login with OIDC**. The system browser completes provider login; the app listens on localhost for the callback and then connects with the returned client token. On Android, return to BaoGUI after the browser shows success.
 
+## Testing
+
+`cargo test` runs unit tests plus HTTP fixture tests under `tests/`. Canned OpenBao/Vault responses live in `tests/fixtures/`; mockito serves them locally so the API client is exercised without `BAO_ADDR` / `BAO_TOKEN` or a real server.
+
+Optional live check (needs credentials):
+
+```bash
+cargo test live_read -- --ignored --nocapture
+```
+
 ## Nix
 
 | Output | Role |
