@@ -455,6 +455,47 @@ PY
           };
 
           run-apk = mkRunApkApp;
+
+          mkAndroidSmokeApp = pkgs.writeShellApplication {
+            name = "android-smoke";
+            runtimeInputs = [
+              rustAndroid
+              pkgs.cargo-apk
+              pkgs.android-tools
+              pkgs.jdk17_headless
+              pkgs.python3
+              pkgs.findutils
+              pkgs.gawk
+              pkgs.gnugrep
+              pkgs.coreutils
+              pkgs.bash
+              pkgs.docker-client
+            ];
+            text = ''
+              set -euo pipefail
+              export ANDROID_HOME="''${ANDROID_HOME:-${androidSdkRoot}}"
+              export ANDROID_SDK_ROOT="''${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+              export ANDROID_NDK_HOME="''${ANDROID_NDK_HOME:-${androidSdkRoot}/ndk-bundle}"
+              export ANDROID_NDK_ROOT="''${ANDROID_NDK_ROOT:-$ANDROID_NDK_HOME}"
+              if [[ ! -d "$ANDROID_NDK_HOME" ]]; then
+                ndk="$(echo "$ANDROID_HOME"/ndk/* | awk '{print $1}')"
+                if [[ -n "''${ndk:-}" && -d "$ndk" ]]; then
+                  export ANDROID_NDK_HOME="$ndk"
+                  export ANDROID_NDK_ROOT="$ndk"
+                fi
+              fi
+              export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
+              script=""
+              if [[ -f ./scripts/android-smoke.sh ]]; then
+                script=./scripts/android-smoke.sh
+              else
+                script="${./scripts/android-smoke.sh}"
+              fi
+              exec bash "$script" "$@"
+            '';
+          };
+
+          android-smoke = mkAndroidSmokeApp;
         in
         {
           default = baogui;
@@ -468,6 +509,7 @@ PY
           emulator = run-emulator;
           inherit run-emulator;
           inherit run-apk;
+          inherit android-smoke;
         }
       );
 
@@ -589,6 +631,10 @@ PY
             type = "app";
             program = "${self.packages.${system}.run-apk}/bin/run-apk";
           };
+          android-smoke = {
+            type = "app";
+            program = "${self.packages.${system}.android-smoke}/bin/android-smoke";
+          };
         }
       );
 
@@ -622,6 +668,7 @@ PY
               echo "  nix run .#waydroid           # cargo-apk x86_64 → Waydroid"
               echo "  nix run .#run-apk            # auto: waydroid | KVM emulator | desktop"
               echo "  nix run .#emulator           # KVM emulator (needs /dev/kvm)"
+              echo "  nix run .#android-smoke      # x86_64 APK → budtmo/docker-android smoke"
             '';
           };
         }
