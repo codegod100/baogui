@@ -42,9 +42,13 @@ build/run still uses **plain `cargo`** on the host rustup toolchain; `nix develo
 is available when you need egui link libraries from the flake. Standard commands
 live in `README.md` / `flake.nix`. Non-obvious caveats:
 
-- **Nix daemon:** started during install. If `nix` later fails with a daemon
-  socket error, run:
-  `sudo nohup /nix/var/nix/profiles/default/bin/nix-daemon >/tmp/nix-daemon.log 2>&1 &`
+- **Nix daemon:** started during install / `start` (`bash .cursor/install.sh
+  ensure-nix`). With `--init none`, a leftover socket after reboot is stale —
+  the script probes `nix store ping`, removes a dead socket, then starts the
+  daemon. Manual recovery:
+  `bash .cursor/install.sh ensure-nix`
+  (or `sudo rm -f /nix/var/nix/daemon-socket/socket` then
+  `sudo nohup /nix/var/nix/profiles/default/bin/nix daemon >/tmp/nix-daemon.log 2>&1 &`).
 - **Load nix in a bare shell:**
   `. /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh`
 - **Toolchain:** needs Rust ≥ 1.85 (a transitive dep requires `edition2024`). The
