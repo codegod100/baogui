@@ -246,7 +246,25 @@ build_apk() {
   (
     cd "$APP"
     [[ "${BAOGUI_WAYDROID_CLEAN:-0}" == "1" ]] && cargo clean -p baogui-android --target "$TARGET" >&2 2>/dev/null || true
+    # cargo-apk rejects a nested [workspace] table; keep it in the committed
+    # Cargo.toml for in-tree cargo metadata, strip only for the build.
+    toml_bak=""
+    if grep -q '^\[workspace\]' Cargo.toml; then
+      toml_bak="$(mktemp)"
+      cp Cargo.toml "$toml_bak"
+      python3 - <<'PY'
+from pathlib import Path
+import re
+p = Path("Cargo.toml")
+p.write_text(re.sub(r"\n\[workspace\][^\[]*", "\n", p.read_text(), count=1))
+PY
+      trap '[[ -n "${toml_bak:-}" && -f "$toml_bak" ]] && mv "$toml_bak" Cargo.toml' EXIT
+    fi
     cargo apk "${apk_args[@]}" >&2
+    if [[ -n "$toml_bak" && -f "$toml_bak" ]]; then
+      mv "$toml_bak" Cargo.toml
+      trap - EXIT
+    fi
   )
   find_apk "$profile"
 }
