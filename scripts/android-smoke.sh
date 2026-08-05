@@ -183,47 +183,100 @@ start_container() {
   ok "container ${NAME} started; noVNC http://127.0.0.1:${VNC_PORT}"
 }
 
+ctr_exec() {
+  # device_status / logs live under the androidusr home directory.
+  docker exec -u androidusr -w /home/androidusr "${NAME}" "$@"
+}
+
+emulator_alive() {
+  # AVD creation runs before qemu; allow a grace window.
+  if ctr_exec bash -lc 'pgrep -f qemu-system >/dev/null || pgrep -f "/emulator/emulator" >/dev/null'; then
+    return 0
+  fi
+  # Still starting (device supervisor / avdmanager) counts as alive early on.
+  ctr_exec bash -lc 'pgrep -f "docker-android start device" >/dev/null'
+}
+
 wait_for_boot() {
   need adb
-  local i status boot svc pm elapsed=0
+  local status boot svc pm elapsed=0
+  local grace="${BAOGUI_DOCKER_ANDROID_BOOT_GRACE:-90}"
   log "waiting for emulator boot (timeout ${BOOT_TIMEOUT}s)…"
   while [[ "$elapsed" -lt "$BOOT_TIMEOUT" ]]; do
-    status="$(docker exec "${NAME}" cat device_status 2>/dev/null || echo UNKNOWN)"
+    status="$(ctr_exec cat device_status 2>/dev/null || echo UNKNOWN)"
     adb connect "${SERIAL}" >/dev/null 2>&1 || true
     boot="$(adb -s "${SERIAL}" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)"
     svc="$(adb -s "${SERIAL}" shell service check package 2>/dev/null | tr -d '\r' || true)"
     pm="$(adb -s "${SERIAL}" shell pm path android 2>/dev/null | tr -d '\r' || true)"
-    if [[ "$boot" == "1" ]] && echo "$svc" | grep -q 'found' && [[ -n "$pm" ]]; then
+    if [[ "$boot" == "1" ]] && echo "$svc" | grep -q 'found' && [[ "$pm" == package:* ]]; then
       # Soften first-boot ANRs / setup wizards that block installs.
       adb -s "${SERIAL}" shell settings put global device_provisioned 1 >/dev/null 2>&1 || true
       adb -s "${SERIAL}" shell settings put secure user_setup_complete 1 >/dev/null 2>&1 || true
+      # Software-accel images often flap package manager right after boot_completed.
+      sleep 10
+      pm="$(adb -s "${SERIAL}" shell pm path android 2>/dev/null | tr -d '\r' || true)"
+      if [[ "$pm" != package:* ]]; then
+        log "package manager flapped after boot_completed — continuing to wait…"
+        sleep 5
+        elapsed=$((elapsed + 15))
+        continue
+      fi
       ok "emulator ready (status=${status} serial=${SERIAL})"
       export ANDROID_SERIAL="${SERIAL}"
       return 0
     fi
-    if ! docker exec "${NAME}" bash -lc 'pgrep -a qemu-system >/dev/null || pgrep -a emulator >/dev/null' 2>/dev/null; then
-      docker exec "${NAME}" bash -lc 'tail -80 logs/device.stdout.log 2>/dev/null; tail -40 logs/device.stderr.log 2>/dev/null' >&2 || true
+    if [[ "$elapsed" -ge "$grace" ]] && ! emulator_alive; then
+      ctr_exec bash -lc 'tail -80 logs/device.stdout.log 2>/dev/null; tail -40 logs/device.stderr.log 2>/dev/null' >&2 || true
       fail "emulator process died during boot (device_status=${status})"
     fi
     sleep 5
     elapsed=$((elapsed + 5))
   done
-  fail "emulator boot timed out after ${BOOT_TIMEOUT}s (status=$(docker exec "${NAME}" cat device_status 2>/dev/null || echo UNKNOWN))"
+  fail "emulator boot timed out after ${BOOT_TIMEOUT}s (status=$(ctr_exec cat device_status 2>/dev/null || echo UNKNOWN))"
+}
+
+wait_for_package_manager() {
+  local i pm svc
+  for i in $(seq 1 60); do
+    adb connect "${SERIAL}" >/dev/null 2>&1 || true
+    svc="$(adb -s "${SERIAL}" shell service check package 2>/dev/null | tr -d '\r' || true)"
+    pm="$(adb -s "${SERIAL}" shell pm path android 2>/dev/null | tr -d '\r' || true)"
+    if echo "$svc" | grep -q 'found' && [[ "$pm" == package:* ]]; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
 }
 
 install_and_launch() {
-  local apk="$1"
+  local apk="$1" attempt
   [[ -f "$apk" ]] || fail "APK not found: $apk"
   need adb
   export ANDROID_SERIAL="${SERIAL}"
   adb connect "${SERIAL}" >/dev/null 2>&1 || true
   adb -s "${SERIAL}" wait-for-device
+  wait_for_package_manager || fail "package manager not stable after boot"
   log "installing $apk…"
-  adb -s "${SERIAL}" install -r -t "$apk" >&2
+  for attempt in 1 2 3 4 5; do
+    if adb -s "${SERIAL}" install -r -t "$apk" >&2; then
+      break
+    fi
+    [[ "$attempt" -eq 5 ]] && fail "adb install failed after ${attempt} attempts"
+    log "adb install attempt $attempt failed — retrying…"
+    wait_for_package_manager || true
+    sleep 5
+  done
   adb -s "${SERIAL}" shell am force-stop "$PKG" >/dev/null 2>&1 || true
   adb -s "${SERIAL}" logcat -c >/dev/null 2>&1 || true
   log "launching $ACTIVITY…"
-  adb -s "${SERIAL}" shell am start -n "$ACTIVITY" >&2
+  for attempt in 1 2 3 4 5; do
+    if adb -s "${SERIAL}" shell am start -n "$ACTIVITY" >&2; then
+      break
+    fi
+    [[ "$attempt" -eq 5 ]] && fail "am start failed after ${attempt} attempts"
+    sleep 3
+  done
 }
 
 wait_for_pid() {
