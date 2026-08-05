@@ -529,7 +529,8 @@ mod tests {
 mod live_tests {
     use super::*;
 
-    /// `BAO_ADDR` + token required. Run: `cargo test live_read -- --ignored --nocapture`
+    /// Live OpenBao only. Prefer fixture tests in `tests/api_fixtures.rs` (no creds).
+    /// Run: `cargo test live_read -- --ignored --nocapture`
     #[test]
     #[ignore = "live OpenBao network"]
     fn live_read_ai_api_keys() {

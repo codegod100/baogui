@@ -1,0 +1,28 @@
+{
+  "request_id": "fixture-lookup-self",
+  "lease_id": "",
+  "renewable": false,
+  "lease_duration": 0,
+  "data": {
+    "accessor": "fixture-accessor",
+    "creation_time": 1754000000,
+    "creation_ttl": 0,
+    "display_name": "token",
+    "entity_id": "",
+    "expire_time": null,
+    "explicit_max_ttl": 0,
+    "id": "fixture-token",
+    "issue_time": "2026-01-01T00:00:00Z",
+    "meta": null,
+    "num_uses": 0,
+    "orphan": true,
+    "path": "auth/token/create",
+    "policies": ["root"],
+    "renewable": false,
+    "ttl": 0,
+    "type": "service"
+  },
+  "wrap_info": null,
+  "warnings": null,
+  "auth": null
+}

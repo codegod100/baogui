@@ -35,3 +35,7 @@ eframe = { version = "0.31", default-features = false, features = [
     "wayland",
     "x11",
 ] }
+
+[dev-dependencies]
+mockito = "1"
+serde_json = "1"

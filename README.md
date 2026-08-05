@@ -57,6 +57,16 @@ nix build .#baogui      # pure package (binary + .desktop + icons)
 | `BAO_TOKEN` / `VAULT_TOKEN` | Auth token |
 | `BAO_TOKEN_PATH` | Token file (default `~/.vault-token`) |
 
+## Testing
+
+`cargo test` runs unit tests plus HTTP fixture tests under `tests/`. Canned OpenBao/Vault responses live in `tests/fixtures/`; mockito serves them locally so the API client is exercised without `BAO_ADDR` / `BAO_TOKEN` or a real server.
+
+Optional live check (needs credentials):
+
+```bash
+cargo test live_read -- --ignored --nocapture
+```
+
 ## Nix
 
 | Output | Role |
