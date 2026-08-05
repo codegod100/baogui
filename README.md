@@ -11,6 +11,7 @@ This is a port of [BaoGTK](../baogtk) with the same OpenBao API surface, rebuilt
 ## Features
 
 - Auto-connect with stored token (`BAO_TOKEN` / `~/.vault-token` / `~/.bao-token`); token field only appears if that fails
+- OIDC browser login (same flow as `bao login -method=oidc`, callback on `http://localhost:8250/oidc/callback`)
 - Auto-detect KV mount (prefers `secret/`)
 - Browse folders and secrets
 - Read, create, edit, and permanently delete KV v2 secrets
@@ -56,6 +57,19 @@ nix build .#baogui      # pure package (binary + .desktop + icons)
 | `BAO_ADDR` / `VAULT_ADDR` | Server URL (default `http://127.0.0.1:8200`) |
 | `BAO_TOKEN` / `VAULT_TOKEN` | Auth token |
 | `BAO_TOKEN_PATH` | Token file (default `~/.vault-token`) |
+| `BAO_OIDC_MOUNT` / `VAULT_OIDC_MOUNT` | OIDC auth mount path (default `oidc`) |
+| `BAO_OIDC_ROLE` / `VAULT_OIDC_ROLE` | Optional OIDC role (uses server `default_role` if empty) |
+| `BAO_OIDC_PORT` / `VAULT_OIDC_PORT` | Local OIDC callback port (default `8250`) |
+
+### OIDC setup
+
+Enable JWT/OIDC auth on OpenBao (often mounted at `oidc`) and allow the CLI redirect URI:
+
+```text
+http://localhost:8250/oidc/callback
+```
+
+In BaoGUI, choose **OIDC**, set the mount/role if needed, then **Login with OIDC**. The browser completes provider login and returns a client token to the app.
 
 ## Nix
 

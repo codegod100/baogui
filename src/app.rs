@@ -14,6 +14,8 @@ use vidya::{
 use vidya::reserve_system_chrome;
 
 use crate::api::{Client, SearchIndex, SearchMatch, SecretData};
+#[cfg(not(target_os = "android"))]
+use crate::oidc::{start_oidc_login, OidcLogin, OidcLoginConfig, OidcLoginEvent};
 
 const TOAST_SECS: u64 = 3;
 const SIDEBAR_W: f32 = 260.0;
@@ -23,6 +25,13 @@ const SEARCH_DEBOUNCE: Duration = Duration::from_millis(400);
 enum Screen {
     Connect,
     Main,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AuthMethod {
+    Token,
+    #[cfg(not(target_os = "android"))]
+    Oidc,
 }
 
 #[derive(Clone)]
@@ -65,6 +74,15 @@ pub struct BaoGuiApp {
     // Connect form
     address: String,
     token: String,
+    auth_method: AuthMethod,
+    #[cfg(not(target_os = "android"))]
+    oidc_mount: String,
+    #[cfg(not(target_os = "android"))]
+    oidc_role: String,
+    #[cfg(not(target_os = "android"))]
+    oidc_login: Option<OidcLogin>,
+    #[cfg(not(target_os = "android"))]
+    oidc_auth_url: String,
     connect_status: String,
     /// When false, a stored token is used and the token field is hidden.
     show_token_field: bool,
@@ -121,11 +139,22 @@ impl BaoGuiApp {
 
         let token = load_stored_token();
         let has_stored = !token.is_empty();
+        #[cfg(not(target_os = "android"))]
+        let oidc_defaults = OidcLoginConfig::from_env_defaults();
 
         Self {
             screen: Screen::Connect,
             address,
             token,
+            auth_method: AuthMethod::Token,
+            #[cfg(not(target_os = "android"))]
+            oidc_mount: oidc_defaults.mount,
+            #[cfg(not(target_os = "android"))]
+            oidc_role: oidc_defaults.role,
+            #[cfg(not(target_os = "android"))]
+            oidc_login: None,
+            #[cfg(not(target_os = "android"))]
+            oidc_auth_url: String::new(),
             connect_status: if has_stored {
                 "Connecting with stored token…".into()
             } else {
@@ -252,7 +281,82 @@ impl BaoGuiApp {
         }
     }
 
+    #[cfg(not(target_os = "android"))]
+    fn cancel_oidc_login(&mut self) {
+        if let Some(login) = self.oidc_login.take() {
+            login.cancel();
+        }
+        self.oidc_auth_url.clear();
+    }
+
+    #[cfg(not(target_os = "android"))]
+    fn start_oidc(&mut self) {
+        let addr = self.address.trim().to_string();
+        if addr.is_empty() {
+            self.connect_status = "Server address is required.".into();
+            return;
+        }
+        let mount = self.oidc_mount.clone();
+        let role = self.oidc_role.clone();
+        self.cancel_oidc_login();
+        let mut cfg = OidcLoginConfig::from_env_defaults();
+        cfg.address = addr;
+        cfg.mount = mount;
+        cfg.role = role;
+        match start_oidc_login(cfg) {
+            Ok(login) => {
+                self.oidc_login = Some(login);
+                self.connect_status = "Waiting for OIDC login in browser…".into();
+            }
+            Err(e) => {
+                self.connect_status = e;
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "android"))]
+    fn poll_oidc_login(&mut self, ctx: &egui::Context) {
+        let Some(login) = &self.oidc_login else {
+            return;
+        };
+        let event = login.try_recv();
+        let Some(event) = event else {
+            ctx.request_repaint_after(Duration::from_millis(100));
+            return;
+        };
+        match event {
+            OidcLoginEvent::Ready {
+                auth_url,
+                browser_error,
+            } => {
+                self.oidc_auth_url = auth_url;
+                self.connect_status = if let Some(err) = browser_error {
+                    format!("Could not open browser ({err}). Open the URL below.")
+                } else {
+                    "Complete login in your browser…".into()
+                };
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+            OidcLoginEvent::Success { token } => {
+                self.oidc_login = None;
+                self.oidc_auth_url.clear();
+                self.token = token;
+                self.show_token_field = false;
+                self.auth_method = AuthMethod::Token;
+                self.connect_status = "OIDC login succeeded. Connecting…".into();
+                self.connect();
+            }
+            OidcLoginEvent::Failed(msg) => {
+                self.oidc_login = None;
+                self.oidc_auth_url.clear();
+                self.connect_status = msg;
+            }
+        }
+    }
+
     fn disconnect(&mut self) {
+        #[cfg(not(target_os = "android"))]
+        self.cancel_oidc_login();
         self.client = None;
         self.folder.clear();
         self.current_path.clear();
@@ -271,6 +375,7 @@ impl BaoGuiApp {
             self.token = stored;
             self.show_token_field = false;
             self.connect_status.clear();
+            self.auth_method = AuthMethod::Token;
         } else {
             self.show_token_field = true;
         }
@@ -667,6 +772,11 @@ impl eframe::App for BaoGuiApp {
             }
         }
 
+        #[cfg(not(target_os = "android"))]
+        if self.screen == Screen::Connect && self.oidc_login.is_some() {
+            self.poll_oidc_login(ctx);
+        }
+
         // Resolve sidebar opens *before* painting so the detail pane sees data.
         if let Some(name) = self.pending_open.take() {
             self.open_list_item(&name);
@@ -716,46 +826,127 @@ impl BaoGuiApp {
                         ui.add_space(th.spacing.xs);
                         text_field_singleline(ui, th, &mut self.address);
 
-                        if self.show_token_field {
-                            ui.add_space(th.spacing.md);
-                            dim_label(ui, th, "Token");
-                            ui.add_space(th.spacing.xs);
-                            let tw = ui.available_width().max(1.0);
-                            ui.add(
-                                TextEdit::singleline(&mut self.token)
-                                    .password(true)
-                                    .margin(th.text_edit_margin())
-                                    .min_size(Vec2::new(0.0, th.spacing.control_height))
-                                    .desired_width(tw),
-                            );
-                        } else if !self.token.is_empty() {
-                            ui.add_space(th.spacing.md);
-                            dim_label(ui, th, "Token: using stored credential");
-                            ui.add_space(th.spacing.xs);
-                            if button(ui, th, "Use a different token").clicked() {
-                                self.show_token_field = true;
-                                self.token.clear();
+                        ui.add_space(th.spacing.md);
+                        dim_label(ui, th, "Auth method");
+                        ui.add_space(th.spacing.xs);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .selectable_label(
+                                    self.auth_method == AuthMethod::Token,
+                                    "Token",
+                                )
+                                .clicked()
+                            {
+                                #[cfg(not(target_os = "android"))]
+                                self.cancel_oidc_login();
+                                self.auth_method = AuthMethod::Token;
                                 self.connect_status.clear();
+                            }
+                            #[cfg(not(target_os = "android"))]
+                            if ui
+                                .selectable_label(self.auth_method == AuthMethod::Oidc, "OIDC")
+                                .clicked()
+                            {
+                                self.auth_method = AuthMethod::Oidc;
+                                self.connect_status.clear();
+                            }
+                        });
+
+                        match self.auth_method {
+                            AuthMethod::Token => {
+                                if self.show_token_field {
+                                    ui.add_space(th.spacing.md);
+                                    dim_label(ui, th, "Token");
+                                    ui.add_space(th.spacing.xs);
+                                    let tw = ui.available_width().max(1.0);
+                                    ui.add(
+                                        TextEdit::singleline(&mut self.token)
+                                            .password(true)
+                                            .margin(th.text_edit_margin())
+                                            .min_size(Vec2::new(0.0, th.spacing.control_height))
+                                            .desired_width(tw),
+                                    );
+                                } else if !self.token.is_empty() {
+                                    ui.add_space(th.spacing.md);
+                                    dim_label(ui, th, "Token: using stored credential");
+                                    ui.add_space(th.spacing.xs);
+                                    if button(ui, th, "Use a different token").clicked() {
+                                        self.show_token_field = true;
+                                        self.token.clear();
+                                        self.connect_status.clear();
+                                    }
+                                }
+                            }
+                            #[cfg(not(target_os = "android"))]
+                            AuthMethod::Oidc => {
+                                ui.add_space(th.spacing.md);
+                                dim_label(ui, th, "OIDC mount");
+                                ui.add_space(th.spacing.xs);
+                                text_field_singleline(ui, th, &mut self.oidc_mount);
+                                ui.add_space(th.spacing.md);
+                                dim_label(ui, th, "Role (optional)");
+                                ui.add_space(th.spacing.xs);
+                                text_field_singleline(ui, th, &mut self.oidc_role);
+                                if !self.oidc_auth_url.is_empty() {
+                                    ui.add_space(th.spacing.md);
+                                    dim_label(ui, th, "Authorization URL");
+                                    ui.add_space(th.spacing.xs);
+                                    let tw = ui.available_width().max(1.0);
+                                    ui.add(
+                                        TextEdit::multiline(&mut self.oidc_auth_url)
+                                            .desired_width(tw)
+                                            .desired_rows(3),
+                                    );
+                                }
                             }
                         }
                     });
 
                     ui.add_space(th.spacing.lg);
-                    let can_connect = !self.address.trim().is_empty()
-                        && (self.show_token_field && !self.token.trim().is_empty()
-                            || !self.show_token_field && !self.token.is_empty());
-                    if primary_button(ui, th, "Connect").clicked()
-                        || (ui.input(|i| i.key_pressed(Key::Enter)) && can_connect)
-                    {
-                        self.connect();
+                    #[cfg(not(target_os = "android"))]
+                    let oidc_busy = self.oidc_login.is_some();
+                    #[cfg(target_os = "android")]
+                    let oidc_busy = false;
+
+                    match self.auth_method {
+                        AuthMethod::Token => {
+                            let can_connect = !self.address.trim().is_empty()
+                                && (self.show_token_field && !self.token.trim().is_empty()
+                                    || !self.show_token_field && !self.token.is_empty());
+                            if primary_button(ui, th, "Connect").clicked()
+                                || (ui.input(|i| i.key_pressed(Key::Enter)) && can_connect)
+                            {
+                                self.connect();
+                            }
+                        }
+                        #[cfg(not(target_os = "android"))]
+                        AuthMethod::Oidc => {
+                            if oidc_busy {
+                                if button(ui, th, "Cancel OIDC").clicked() {
+                                    self.cancel_oidc_login();
+                                    self.connect_status = "OIDC login cancelled.".into();
+                                }
+                            } else {
+                                let can_login = !self.address.trim().is_empty();
+                                if primary_button(ui, th, "Login with OIDC").clicked()
+                                    || (ui.input(|i| i.key_pressed(Key::Enter)) && can_login)
+                                {
+                                    self.start_oidc();
+                                }
+                            }
+                        }
                     }
 
                     if !self.connect_status.is_empty() {
                         ui.add_space(th.spacing.sm);
+                        let waiting = self.connect_status.starts_with("Connecting")
+                            || self.connect_status.starts_with("Waiting")
+                            || self.connect_status.starts_with("Complete login")
+                            || self.connect_status.starts_with("OIDC login succeeded");
                         ui.label(
                             RichText::new(&self.connect_status)
                                 .size(th.type_scale.caption)
-                                .color(if self.connect_status.starts_with("Connecting") {
+                                .color(if waiting {
                                     th.palette.text_secondary
                                 } else {
                                     th.palette.destructive
@@ -767,7 +958,7 @@ impl BaoGuiApp {
                     dim_label(
                         ui,
                         th,
-                        "Uses BAO_ADDR / BAO_TOKEN / ~/.vault-token when set.\nCompatible with Vault-style KV v2 mounts.",
+                        "Token: BAO_ADDR / BAO_TOKEN / ~/.vault-token.\nOIDC: browser login via localhost:8250 (bao login -method=oidc).\nCompatible with Vault-style KV v2 mounts.",
                     );
                 });
             });
