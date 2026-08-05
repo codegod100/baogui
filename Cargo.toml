@@ -27,6 +27,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 url = "2"
 rayon = "1.10"
+# Opens the system browser for OIDC (desktop + Android via JNI / ACTION_VIEW).
+webbrowser = "1"
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 eframe = { version = "0.31", default-features = false, features = [

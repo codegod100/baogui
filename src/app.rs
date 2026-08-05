@@ -7,22 +7,38 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Align, Key, Layout, RichText, ScrollArea, TextEdit, Vec2};
 use vidya::{
     apply, body, button, card, central_page, data_table, destructive_button, dim_label,
-    icon_button, primary_button, table_text, text_field_multiline, text_field_singleline, title,
-    title_2, Col, ColKind, Icon, Theme,
+    icon_button, lead_trail, primary_button, table_text, text_field_multiline,
+    text_field_singleline, title, title_2, Col, ColKind, Icon, Theme,
 };
 #[cfg(target_os = "android")]
 use vidya::reserve_system_chrome;
 
 use crate::api::{Client, SearchIndex, SearchMatch, SecretData};
+use crate::oidc::{start_oidc_login, OidcLogin, OidcLoginConfig, OidcLoginEvent};
 
 const TOAST_SECS: u64 = 3;
 const SIDEBAR_W: f32 = 260.0;
+/// Below this window width, use a single-pane (list ↔ detail) layout.
+const COMPACT_WIDTH: f32 = 800.0;
+/// Below this pane width, stack toolbars / KV rows instead of side-by-side.
+const NARROW_PANE: f32 = 480.0;
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(400);
+
+fn is_compact(ctx: &egui::Context) -> bool {
+    // Android APK is phone-first: always single-pane. Desktop uses the width break.
+    cfg!(target_os = "android") || ctx.screen_rect().width() < COMPACT_WIDTH
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Screen {
     Connect,
     Main,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AuthMethod {
+    Token,
+    Oidc,
 }
 
 #[derive(Clone)]
@@ -65,6 +81,11 @@ pub struct BaoGuiApp {
     // Connect form
     address: String,
     token: String,
+    auth_method: AuthMethod,
+    oidc_mount: String,
+    oidc_role: String,
+    oidc_login: Option<OidcLogin>,
+    oidc_auth_url: String,
     connect_status: String,
     /// When false, a stored token is used and the token field is hidden.
     show_token_field: bool,
@@ -121,11 +142,17 @@ impl BaoGuiApp {
 
         let token = load_stored_token();
         let has_stored = !token.is_empty();
+        let oidc_defaults = OidcLoginConfig::from_env_defaults();
 
         Self {
             screen: Screen::Connect,
             address,
             token,
+            auth_method: AuthMethod::Token,
+            oidc_mount: oidc_defaults.mount,
+            oidc_role: oidc_defaults.role,
+            oidc_login: None,
+            oidc_auth_url: String::new(),
             connect_status: if has_stored {
                 "Connecting with stored token…".into()
             } else {
@@ -252,7 +279,78 @@ impl BaoGuiApp {
         }
     }
 
+    fn cancel_oidc_login(&mut self) {
+        if let Some(login) = self.oidc_login.take() {
+            login.cancel();
+        }
+        self.oidc_auth_url.clear();
+    }
+
+    fn start_oidc(&mut self) {
+        let addr = self.address.trim().to_string();
+        if addr.is_empty() {
+            self.connect_status = "Server address is required.".into();
+            return;
+        }
+        let mount = self.oidc_mount.clone();
+        let role = self.oidc_role.clone();
+        self.cancel_oidc_login();
+        let mut cfg = OidcLoginConfig::from_env_defaults();
+        cfg.address = addr;
+        cfg.mount = mount;
+        cfg.role = role;
+        match start_oidc_login(cfg) {
+            Ok(login) => {
+                self.oidc_login = Some(login);
+                self.connect_status = "Waiting for OIDC login in browser…".into();
+            }
+            Err(e) => {
+                self.connect_status = e;
+            }
+        }
+    }
+
+    fn poll_oidc_login(&mut self, ctx: &egui::Context) {
+        let Some(login) = &self.oidc_login else {
+            return;
+        };
+        let event = login.try_recv();
+        let Some(event) = event else {
+            ctx.request_repaint_after(Duration::from_millis(100));
+            return;
+        };
+        match event {
+            OidcLoginEvent::Ready {
+                auth_url,
+                browser_error,
+            } => {
+                self.oidc_auth_url = auth_url;
+                self.connect_status = if let Some(err) = browser_error {
+                    format!("Could not open browser ({err}). Open the URL below.")
+                } else {
+                    "Complete login in your browser, then return here…".into()
+                };
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+            OidcLoginEvent::Success { token } => {
+                self.oidc_login = None;
+                self.oidc_auth_url.clear();
+                self.token = token;
+                self.show_token_field = false;
+                self.auth_method = AuthMethod::Token;
+                self.connect_status = "OIDC login succeeded. Connecting…".into();
+                self.connect();
+            }
+            OidcLoginEvent::Failed(msg) => {
+                self.oidc_login = None;
+                self.oidc_auth_url.clear();
+                self.connect_status = msg;
+            }
+        }
+    }
+
     fn disconnect(&mut self) {
+        self.cancel_oidc_login();
         self.client = None;
         self.folder.clear();
         self.current_path.clear();
@@ -271,6 +369,7 @@ impl BaoGuiApp {
             self.token = stored;
             self.show_token_field = false;
             self.connect_status.clear();
+            self.auth_method = AuthMethod::Token;
         } else {
             self.show_token_field = true;
         }
@@ -667,6 +766,10 @@ impl eframe::App for BaoGuiApp {
             }
         }
 
+        if self.screen == Screen::Connect && self.oidc_login.is_some() {
+            self.poll_oidc_login(ctx);
+        }
+
         // Resolve sidebar opens *before* painting so the detail pane sees data.
         if let Some(name) = self.pending_open.take() {
             self.open_list_item(&name);
@@ -699,13 +802,18 @@ impl BaoGuiApp {
                 });
             });
 
+        let compact = is_compact(ctx);
         central_page(ctx, th, "connect", |g| {
             g.section(|ui| {
                 ui.vertical_centered(|ui| {
-                    ui.add_space(th.spacing.xl * 1.5);
+                    ui.add_space(if compact {
+                        th.spacing.md
+                    } else {
+                        th.spacing.xl * 1.5
+                    });
                     title(ui, th, "BaoGUI");
                     dim_label(ui, th, "Simple OpenBao secrets client");
-                    ui.add_space(th.spacing.lg);
+                    ui.add_space(if compact { th.spacing.md } else { th.spacing.lg });
 
                     let max_w = 420.0_f32;
                     let form_w = ui.available_width().min(max_w);
@@ -716,46 +824,120 @@ impl BaoGuiApp {
                         ui.add_space(th.spacing.xs);
                         text_field_singleline(ui, th, &mut self.address);
 
-                        if self.show_token_field {
-                            ui.add_space(th.spacing.md);
-                            dim_label(ui, th, "Token");
-                            ui.add_space(th.spacing.xs);
-                            let tw = ui.available_width().max(1.0);
-                            ui.add(
-                                TextEdit::singleline(&mut self.token)
-                                    .password(true)
-                                    .margin(th.text_edit_margin())
-                                    .min_size(Vec2::new(0.0, th.spacing.control_height))
-                                    .desired_width(tw),
-                            );
-                        } else if !self.token.is_empty() {
-                            ui.add_space(th.spacing.md);
-                            dim_label(ui, th, "Token: using stored credential");
-                            ui.add_space(th.spacing.xs);
-                            if button(ui, th, "Use a different token").clicked() {
-                                self.show_token_field = true;
-                                self.token.clear();
+                        ui.add_space(th.spacing.md);
+                        dim_label(ui, th, "Auth method");
+                        ui.add_space(th.spacing.xs);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .selectable_label(
+                                    self.auth_method == AuthMethod::Token,
+                                    "Token",
+                                )
+                                .clicked()
+                            {
+                                self.cancel_oidc_login();
+                                self.auth_method = AuthMethod::Token;
                                 self.connect_status.clear();
+                            }
+                            if ui
+                                .selectable_label(self.auth_method == AuthMethod::Oidc, "OIDC")
+                                .clicked()
+                            {
+                                self.auth_method = AuthMethod::Oidc;
+                                self.connect_status.clear();
+                            }
+                        });
+
+                        match self.auth_method {
+                            AuthMethod::Token => {
+                                if self.show_token_field {
+                                    ui.add_space(th.spacing.md);
+                                    dim_label(ui, th, "Token");
+                                    ui.add_space(th.spacing.xs);
+                                    let tw = ui.available_width().max(1.0);
+                                    ui.add(
+                                        TextEdit::singleline(&mut self.token)
+                                            .password(true)
+                                            .margin(th.text_edit_margin())
+                                            .min_size(Vec2::new(0.0, th.spacing.control_height))
+                                            .desired_width(tw),
+                                    );
+                                } else if !self.token.is_empty() {
+                                    ui.add_space(th.spacing.md);
+                                    dim_label(ui, th, "Token: using stored credential");
+                                    ui.add_space(th.spacing.xs);
+                                    if button(ui, th, "Use a different token").clicked() {
+                                        self.show_token_field = true;
+                                        self.token.clear();
+                                        self.connect_status.clear();
+                                    }
+                                }
+                            }
+                            AuthMethod::Oidc => {
+                                ui.add_space(th.spacing.md);
+                                dim_label(ui, th, "OIDC mount");
+                                ui.add_space(th.spacing.xs);
+                                text_field_singleline(ui, th, &mut self.oidc_mount);
+                                ui.add_space(th.spacing.md);
+                                dim_label(ui, th, "Role (optional)");
+                                ui.add_space(th.spacing.xs);
+                                text_field_singleline(ui, th, &mut self.oidc_role);
+                                if !self.oidc_auth_url.is_empty() {
+                                    ui.add_space(th.spacing.md);
+                                    dim_label(ui, th, "Authorization URL");
+                                    ui.add_space(th.spacing.xs);
+                                    let tw = ui.available_width().max(1.0);
+                                    ui.add(
+                                        TextEdit::multiline(&mut self.oidc_auth_url)
+                                            .desired_width(tw)
+                                            .desired_rows(3),
+                                    );
+                                }
                             }
                         }
                     });
 
                     ui.add_space(th.spacing.lg);
-                    let can_connect = !self.address.trim().is_empty()
-                        && (self.show_token_field && !self.token.trim().is_empty()
-                            || !self.show_token_field && !self.token.is_empty());
-                    if primary_button(ui, th, "Connect").clicked()
-                        || (ui.input(|i| i.key_pressed(Key::Enter)) && can_connect)
-                    {
-                        self.connect();
+                    let oidc_busy = self.oidc_login.is_some();
+
+                    match self.auth_method {
+                        AuthMethod::Token => {
+                            let can_connect = !self.address.trim().is_empty()
+                                && (self.show_token_field && !self.token.trim().is_empty()
+                                    || !self.show_token_field && !self.token.is_empty());
+                            if primary_button(ui, th, "Connect").clicked()
+                                || (ui.input(|i| i.key_pressed(Key::Enter)) && can_connect)
+                            {
+                                self.connect();
+                            }
+                        }
+                        AuthMethod::Oidc => {
+                            if oidc_busy {
+                                if button(ui, th, "Cancel OIDC").clicked() {
+                                    self.cancel_oidc_login();
+                                    self.connect_status = "OIDC login cancelled.".into();
+                                }
+                            } else {
+                                let can_login = !self.address.trim().is_empty();
+                                if primary_button(ui, th, "Login with OIDC").clicked()
+                                    || (ui.input(|i| i.key_pressed(Key::Enter)) && can_login)
+                                {
+                                    self.start_oidc();
+                                }
+                            }
+                        }
                     }
 
                     if !self.connect_status.is_empty() {
                         ui.add_space(th.spacing.sm);
+                        let waiting = self.connect_status.starts_with("Connecting")
+                            || self.connect_status.starts_with("Waiting")
+                            || self.connect_status.starts_with("Complete login")
+                            || self.connect_status.starts_with("OIDC login succeeded");
                         ui.label(
                             RichText::new(&self.connect_status)
                                 .size(th.type_scale.caption)
-                                .color(if self.connect_status.starts_with("Connecting") {
+                                .color(if waiting {
                                     th.palette.text_secondary
                                 } else {
                                     th.palette.destructive
@@ -767,7 +949,7 @@ impl BaoGuiApp {
                     dim_label(
                         ui,
                         th,
-                        "Uses BAO_ADDR / BAO_TOKEN / ~/.vault-token when set.\nCompatible with Vault-style KV v2 mounts.",
+                        "Token: BAO_ADDR / BAO_TOKEN / ~/.vault-token.\nOIDC: browser login via localhost:8250 (bao login -method=oidc).\nCompatible with Vault-style KV v2 mounts.",
                     );
                 });
             });
@@ -775,61 +957,36 @@ impl BaoGuiApp {
     }
 
     fn ui_main(&mut self, ctx: &egui::Context, th: &Theme) {
-        egui::TopBottomPanel::top("main_header")
-            .frame(th.header_frame())
-            .show(ctx, |ui| {
-                let mut disconnect = false;
-                let mut refresh = false;
-                let mut new_secret = false;
-                ui.horizontal(|ui| {
-                    if button(ui, th, "Disconnect").clicked() {
-                        disconnect = true;
-                    }
-                    ui.add_space(th.spacing.sm);
-                    title_2(ui, th, "BaoGUI");
-                    dim_label(ui, th, &format!("· {}/", self.mount));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if button(ui, th, "New").clicked() {
-                            new_secret = true;
-                        }
-                        if button(ui, th, "Refresh").clicked() {
-                            refresh = true;
-                        }
-                    });
-                });
-                if disconnect {
-                    self.disconnect();
-                    return;
-                }
-                if refresh {
-                    self.refresh_list();
-                }
-                if new_secret {
-                    self.new_dialog = Some(NewDialog {
-                        path: String::new(),
-                        body: "key=value\n".into(),
-                    });
-                }
-            });
+        let compact = is_compact(ctx);
+        self.ui_main_header(ctx, th, compact);
 
         // Global search before panels so the table + sidebar share one hit list.
         self.tick_search(ctx);
 
-        let filter = self.list_filter.trim().to_lowercase();
-        let searching = !filter.is_empty();
+        let searching = !self.list_filter.trim().is_empty();
         let search_busy = self.search_busy();
-        let visible: Vec<String> = if searching {
-            let mut paths: Vec<String> = self
-                .search_hits
-                .iter()
-                .map(|h| h.path.clone())
-                .collect();
-            paths.sort();
-            paths.dedup();
-            paths
-        } else {
-            self.list_keys.clone()
-        };
+        let visible = self.visible_list_keys(searching);
+
+        if compact {
+            egui::CentralPanel::default()
+                .frame(th.page_frame())
+                .show(ctx, |ui| {
+                    if self.show_detail {
+                        if button(ui, th, "← Back").clicked() {
+                            self.show_detail = false;
+                        }
+                        ui.add_space(th.spacing.sm);
+                        self.ui_secret_detail(ui, ctx, th, true);
+                    } else if searching {
+                        self.ui_search_field(ui, th);
+                        ui.add_space(th.spacing.sm);
+                        self.ui_search_results(ui, ctx, th, true);
+                    } else {
+                        self.ui_browse_list(ui, th, &visible, false, search_busy);
+                    }
+                });
+            return;
+        }
 
         egui::SidePanel::left("sidebar")
             .resizable(true)
@@ -845,140 +1002,14 @@ impl BaoGuiApp {
                     .stroke(egui::Stroke::new(1.0_f32, th.palette.border_soft)),
             )
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    dim_label(ui, th, &format!("Mount: {}/", self.mount));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.add_enabled_ui(!self.folder.is_empty() && !searching, |ui| {
-                            if button(ui, th, "Up").clicked() {
-                                self.go_up();
-                            }
-                        });
-                    });
-                });
-                ui.add_space(th.spacing.xs);
-                ui.label(
-                    RichText::new(if searching {
-                        "Search".to_string()
-                    } else {
-                        self.breadcrumb()
-                    })
-                    .size(th.type_scale.title_2)
-                    .strong()
-                    .color(th.palette.text)
-                    .monospace(),
-                );
-                ui.add_space(th.spacing.sm);
-                ui.separator();
-                ui.add_space(th.spacing.xs);
-
-                let sw = ui.available_width().max(1.0);
-                ui.add(
-                    TextEdit::singleline(&mut self.list_filter)
-                        .hint_text("Search all secrets…")
-                        .margin(th.text_edit_margin())
-                        .desired_width(sw)
-                        .min_size(Vec2::new(0.0, th.spacing.control_height)),
-                );
-                ui.add_space(th.spacing.xs);
-
-                ScrollArea::vertical()
-                    .id_salt("sidebar_list")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        if searching {
-                            if visible.is_empty() {
-                                dim_label(
-                                    ui,
-                                    th,
-                                    if search_busy {
-                                        "(searching…)"
-                                    } else {
-                                        "(no matches)"
-                                    },
-                                );
-                                return;
-                            }
-                            let mut clicked: Option<String> = None;
-                            for path in &visible {
-                                let selected = self.current_path == *path;
-                                let row_w = ui.available_width().max(1.0);
-                                let resp = ui.add_sized(
-                                    [row_w, th.spacing.control_height],
-                                    egui::SelectableLabel::new(
-                                        selected,
-                                        RichText::new(path)
-                                            .size(th.type_scale.body)
-                                            .monospace()
-                                            .color(if selected {
-                                                th.palette.accent
-                                            } else {
-                                                th.palette.text
-                                            }),
-                                    ),
-                                );
-                                if resp.clicked() {
-                                    clicked = Some(path.clone());
-                                }
-                            }
-                            if let Some(path) = clicked {
-                                self.open_secret_at_path(&path);
-                                ui.ctx().request_repaint();
-                            }
-                            return;
-                        }
-
-                        if self.list_keys.is_empty() {
-                            dim_label(ui, th, "(empty)");
-                            return;
-                        }
-
-                        let mut clicked: Option<String> = None;
-                        for key in &visible {
-                            let is_folder = key.ends_with('/');
-                            let display = key.trim_end_matches('/').to_string();
-                            let selected = !is_folder
-                                && (self.current_path == *key
-                                    || self.current_path.ends_with(&format!("/{key}"))
-                                    || self.current_path == display);
-
-                            let row_w = ui.available_width().max(1.0);
-                            let text = if is_folder {
-                                format!("▸  {display}")
-                            } else {
-                                display.clone()
-                            };
-                            let resp = ui.add_sized(
-                                [row_w, th.spacing.control_height],
-                                egui::SelectableLabel::new(
-                                    selected,
-                                    RichText::new(text)
-                                        .size(th.type_scale.body)
-                                        .monospace()
-                                        .color(if selected {
-                                            th.palette.accent
-                                        } else {
-                                            th.palette.text
-                                        }),
-                                ),
-                            );
-                            if resp.clicked() {
-                                clicked = Some(key.clone());
-                            }
-                        }
-                        if let Some(name) = clicked {
-                            self.pending_open = Some(name);
-                            ui.ctx().request_repaint();
-                        }
-                    });
+                self.ui_browse_list(ui, th, &visible, searching, search_busy);
             });
-
-        let searching = !self.list_filter.trim().is_empty();
 
         egui::CentralPanel::default()
             .frame(th.page_frame())
             .show(ctx, |ui| {
                 if searching {
-                    self.ui_search_results(ui, ctx, th);
+                    self.ui_search_results(ui, ctx, th, false);
                     return;
                 }
 
@@ -995,130 +1026,427 @@ impl BaoGuiApp {
                     return;
                 }
 
-                // ── Header ──────────────────────────────────────────
-                ui.horizontal(|ui| {
+                self.ui_secret_detail(ui, ctx, th, false);
+            });
+    }
+
+    fn ui_main_header(&mut self, ctx: &egui::Context, th: &Theme, compact: bool) {
+        egui::TopBottomPanel::top("main_header")
+            .frame(th.header_frame())
+            .show(ctx, |ui| {
+                let mut disconnect = false;
+                let mut refresh = false;
+                let mut new_secret = false;
+
+                if compact {
+                    ui.horizontal(|ui| {
+                        title_2(ui, th, "BaoGUI");
+                        dim_label(ui, th, &format!("{}/", self.mount));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if button(ui, th, "Disconnect").clicked() {
+                                disconnect = true;
+                            }
+                        });
+                    });
+                    ui.horizontal(|ui| {
+                        if button(ui, th, "Refresh").clicked() {
+                            refresh = true;
+                        }
+                        if button(ui, th, "New").clicked() {
+                            new_secret = true;
+                        }
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        if button(ui, th, "Disconnect").clicked() {
+                            disconnect = true;
+                        }
+                        ui.add_space(th.spacing.sm);
+                        title_2(ui, th, "BaoGUI");
+                        dim_label(ui, th, &format!("· {}/", self.mount));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if button(ui, th, "New").clicked() {
+                                new_secret = true;
+                            }
+                            if button(ui, th, "Refresh").clicked() {
+                                refresh = true;
+                            }
+                        });
+                    });
+                }
+
+                if disconnect {
+                    self.disconnect();
+                    return;
+                }
+                if refresh {
+                    self.refresh_list();
+                }
+                if new_secret {
+                    self.new_dialog = Some(NewDialog {
+                        path: String::new(),
+                        body: "key=value\n".into(),
+                    });
+                }
+            });
+    }
+
+    fn visible_list_keys(&self, searching: bool) -> Vec<String> {
+        if searching {
+            let mut paths: Vec<String> = self
+                .search_hits
+                .iter()
+                .map(|h| h.path.clone())
+                .collect();
+            paths.sort();
+            paths.dedup();
+            paths
+        } else {
+            self.list_keys.clone()
+        }
+    }
+
+    fn ui_search_field(&mut self, ui: &mut egui::Ui, th: &Theme) {
+        let sw = ui.available_width().max(1.0);
+        ui.add(
+            TextEdit::singleline(&mut self.list_filter)
+                .hint_text("Search all secrets…")
+                .margin(th.text_edit_margin())
+                .desired_width(sw)
+                .min_size(Vec2::new(0.0, th.spacing.control_height)),
+        );
+    }
+
+    fn ui_browse_list(
+        &mut self,
+        ui: &mut egui::Ui,
+        th: &Theme,
+        visible: &[String],
+        searching: bool,
+        search_busy: bool,
+    ) {
+        ui.horizontal(|ui| {
+            dim_label(ui, th, &format!("Mount: {}/", self.mount));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.add_enabled_ui(!self.folder.is_empty() && !searching, |ui| {
+                    if button(ui, th, "Up").clicked() {
+                        self.go_up();
+                    }
+                });
+            });
+        });
+        ui.add_space(th.spacing.xs);
+        ui.label(
+            RichText::new(if searching {
+                "Search".to_string()
+            } else {
+                self.breadcrumb()
+            })
+            .size(th.type_scale.title_2)
+            .strong()
+            .color(th.palette.text)
+            .monospace(),
+        );
+        ui.add_space(th.spacing.sm);
+        ui.separator();
+        ui.add_space(th.spacing.xs);
+
+        self.ui_search_field(ui, th);
+        ui.add_space(th.spacing.xs);
+
+        ScrollArea::vertical()
+            .id_salt("sidebar_list")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if searching {
+                    if visible.is_empty() {
+                        dim_label(
+                            ui,
+                            th,
+                            if search_busy {
+                                "(searching…)"
+                            } else {
+                                "(no matches)"
+                            },
+                        );
+                        return;
+                    }
+                    let mut clicked: Option<String> = None;
+                    for path in visible {
+                        let selected = self.current_path == *path;
+                        let row_w = ui.available_width().max(1.0);
+                        let resp = ui.add_sized(
+                            [row_w, th.spacing.control_height],
+                            egui::SelectableLabel::new(
+                                selected,
+                                RichText::new(path)
+                                    .size(th.type_scale.body)
+                                    .monospace()
+                                    .color(if selected {
+                                        th.palette.accent
+                                    } else {
+                                        th.palette.text
+                                    }),
+                            ),
+                        );
+                        if resp.clicked() {
+                            clicked = Some(path.clone());
+                        }
+                    }
+                    if let Some(path) = clicked {
+                        self.open_secret_at_path(&path);
+                        ui.ctx().request_repaint();
+                    }
+                    return;
+                }
+
+                if self.list_keys.is_empty() {
+                    dim_label(ui, th, "(empty)");
+                    return;
+                }
+
+                let mut clicked: Option<String> = None;
+                for key in visible {
+                    let is_folder = key.ends_with('/');
+                    let display = key.trim_end_matches('/').to_string();
+                    let selected = !is_folder
+                        && (self.current_path == *key
+                            || self.current_path.ends_with(&format!("/{key}"))
+                            || self.current_path == display);
+
+                    let row_w = ui.available_width().max(1.0);
+                    let text = if is_folder {
+                        format!("▸  {display}")
+                    } else {
+                        display.clone()
+                    };
+                    let resp = ui.add_sized(
+                        [row_w, th.spacing.control_height],
+                        egui::SelectableLabel::new(
+                            selected,
+                            RichText::new(text)
+                                .size(th.type_scale.body)
+                                .monospace()
+                                .color(if selected {
+                                    th.palette.accent
+                                } else {
+                                    th.palette.text
+                                }),
+                        ),
+                    );
+                    if resp.clicked() {
+                        clicked = Some(key.clone());
+                    }
+                }
+                if let Some(name) = clicked {
+                    self.pending_open = Some(name);
+                    ui.ctx().request_repaint();
+                }
+            });
+    }
+
+    fn ui_secret_detail(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        th: &Theme,
+        compact: bool,
+    ) {
+        let narrow = compact || ui.available_width() < NARROW_PANE;
+        let path_display = self.path_display.clone();
+        let meta = self.meta.clone();
+        let mut copy_path = false;
+        if narrow {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new(&path_display)
+                            .size(th.type_scale.title_2)
+                            .strong()
+                            .color(th.palette.text)
+                            .monospace(),
+                    );
+                    if !meta.is_empty() {
+                        dim_label(ui, th, &meta);
+                    }
+                });
+                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                    if icon_button(ui, th, Icon::Copy, "Copy path").clicked() {
+                        copy_path = true;
+                    }
+                });
+            });
+        } else {
+            lead_trail(
+                ui,
+                |ui| {
                     ui.vertical(|ui| {
                         ui.label(
-                            RichText::new(&self.path_display)
+                            RichText::new(&path_display)
                                 .size(th.type_scale.title_2)
                                 .strong()
                                 .color(th.palette.text)
                                 .monospace(),
                         );
-                        if !self.meta.is_empty() {
-                            dim_label(ui, th, &self.meta);
+                        if !meta.is_empty() {
+                            dim_label(ui, th, &meta);
                         }
                     });
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if icon_button(ui, th, Icon::Copy, "Copy path").clicked() {
-                            ctx.copy_text(self.path_display.clone());
-                            self.show_toast("Path copied");
-                        }
-                    });
-                });
-
-                ui.add_space(th.spacing.md);
-                let mut reveal_clicked = false;
-                let mut delete_clicked = false;
-                let mut save_clicked = false;
-                let mut add_key = false;
-                let reveal_label = if self.reveal_values {
-                    "Hide values"
-                } else {
-                    "Show values"
-                };
-                ui.horizontal(|ui| {
-                    if button(ui, th, reveal_label).clicked() {
-                        reveal_clicked = true;
+                },
+                |ui| {
+                    if icon_button(ui, th, Icon::Copy, "Copy path").clicked() {
+                        copy_path = true;
                     }
-                    if button(ui, th, "Add key").clicked() {
-                        add_key = true;
+                },
+            );
+        }
+        if copy_path {
+            ctx.copy_text(path_display);
+            self.show_toast("Path copied");
+        }
+
+        ui.add_space(th.spacing.md);
+        let mut reveal_clicked = false;
+        let mut delete_clicked = false;
+        let mut save_clicked = false;
+        let mut add_key = false;
+        let reveal_label = if self.reveal_values {
+            if narrow {
+                "Hide"
+            } else {
+                "Hide values"
+            }
+        } else if narrow {
+            "Values"
+        } else {
+            "Show values"
+        };
+
+        // Always wrap on narrow panes — RTL toolbars collapse into vertical glyph stacks.
+        if narrow {
+            ui.horizontal_wrapped(|ui| {
+                if button(ui, th, reveal_label).clicked() {
+                    reveal_clicked = true;
+                }
+                if button(ui, th, "Add key").clicked() {
+                    add_key = true;
+                }
+                if primary_button(ui, th, "Save").clicked() {
+                    save_clicked = true;
+                }
+                if destructive_button(ui, th, "Delete").clicked() {
+                    delete_clicked = true;
+                }
+            });
+        } else {
+            ui.horizontal(|ui| {
+                if button(ui, th, reveal_label).clicked() {
+                    reveal_clicked = true;
+                }
+                if button(ui, th, "Add key").clicked() {
+                    add_key = true;
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if destructive_button(ui, th, "Delete").clicked() {
+                        delete_clicked = true;
                     }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if destructive_button(ui, th, "Delete").clicked() {
-                            delete_clicked = true;
-                        }
-                        if primary_button(ui, th, "Save").clicked() {
-                            save_clicked = true;
-                        }
-                    });
+                    if primary_button(ui, th, "Save").clicked() {
+                        save_clicked = true;
+                    }
                 });
-                if reveal_clicked {
-                    self.reveal_values = !self.reveal_values;
-                }
-                if add_key {
-                    self.kv_rows.push(KvRow {
-                        key: String::new(),
-                        value: String::new(),
-                    });
-                }
-                if save_clicked {
-                    self.save_secret();
-                }
-                if delete_clicked {
-                    self.delete_confirm = true;
-                }
+            });
+        }
+        if reveal_clicked {
+            self.reveal_values = !self.reveal_values;
+        }
+        if add_key {
+            self.kv_rows.push(KvRow {
+                key: String::new(),
+                value: String::new(),
+            });
+        }
+        if save_clicked {
+            self.save_secret();
+        }
+        if delete_clicked {
+            self.delete_confirm = true;
+        }
 
-                ui.add_space(th.spacing.md);
-                ui.separator();
-                ui.add_space(th.spacing.sm);
+        ui.add_space(th.spacing.md);
+        ui.separator();
+        ui.add_space(th.spacing.sm);
 
-                if self.kv_rows.is_empty() {
-                    dim_label(ui, th, "No key/value pairs in this secret.");
-                    return;
-                }
+        if self.kv_rows.is_empty() {
+            dim_label(ui, th, "No key/value pairs in this secret.");
+            return;
+        }
 
-                // Column headers
-                let full_w = ui.available_width().max(1.0);
-                let ctrl_h = th.spacing.control_height;
-                let act_w = ctrl_h * 2.0 + th.spacing.sm; // copy icon + remove
-                let key_w = (full_w * 0.32).clamp(140.0, 280.0);
-                let val_w = (full_w - key_w - act_w - th.spacing.md).max(80.0);
-                let row_h = ctrl_h + 4.0;
+        let full_w = ui.available_width().max(1.0);
+        let ctrl_h = th.spacing.control_height;
+        let act_w = ctrl_h * 2.0 + th.spacing.sm;
+        let stack_kv = narrow || full_w < 420.0;
+        let key_w = if stack_kv {
+            full_w
+        } else {
+            (full_w * 0.32).clamp(140.0, 280.0)
+        };
+        let val_w = if stack_kv {
+            (full_w - act_w - th.spacing.sm).max(80.0)
+        } else {
+            (full_w - key_w - act_w - th.spacing.md).max(80.0)
+        };
+        let row_h = if stack_kv {
+            ctrl_h * 2.0 + th.spacing.xs + 8.0
+        } else {
+            ctrl_h + 4.0
+        };
 
-                ui.horizontal(|ui| {
-                    ui.add_space(4.0);
-                    ui.add_sized(
-                        [key_w, 16.0],
-                        egui::Label::new(
-                            RichText::new("Key")
-                                .size(th.type_scale.caption)
-                                .color(th.palette.text_secondary),
-                        ),
-                    );
-                    ui.add_sized(
-                        [val_w, 16.0],
-                        egui::Label::new(
-                            RichText::new("Value")
-                                .size(th.type_scale.caption)
-                                .color(th.palette.text_secondary),
-                        ),
-                    );
-                });
-                ui.add_space(th.spacing.xs);
+        if !stack_kv {
+            ui.horizontal(|ui| {
+                ui.add_space(4.0);
+                ui.add_sized(
+                    [key_w, 16.0],
+                    egui::Label::new(
+                        RichText::new("Key")
+                            .size(th.type_scale.caption)
+                            .color(th.palette.text_secondary),
+                    ),
+                );
+                ui.add_sized(
+                    [val_w, 16.0],
+                    egui::Label::new(
+                        RichText::new("Value")
+                            .size(th.type_scale.caption)
+                            .color(th.palette.text_secondary),
+                    ),
+                );
+            });
+            ui.add_space(th.spacing.xs);
+        }
 
-                let n = self.kv_rows.len();
-                let reveal = self.reveal_values;
-                let mut remove_idx: Option<usize> = None;
-                let mut copy_val: Option<String> = None;
+        let n = self.kv_rows.len();
+        let reveal = self.reveal_values;
+        let mut remove_idx: Option<usize> = None;
+        let mut copy_val: Option<String> = None;
 
-                ScrollArea::vertical()
-                    .id_salt("kv_list")
-                    .auto_shrink([false, false])
-                    .show_rows(ui, row_h, n, |ui, row_range| {
-                        for i in row_range {
-                            let row = &mut self.kv_rows[i];
+        ScrollArea::vertical()
+            .id_salt("kv_list")
+            .auto_shrink([false, false])
+            .show_rows(ui, row_h, n, |ui, row_range| {
+                for i in row_range {
+                    let row = &mut self.kv_rows[i];
+                    if stack_kv {
+                        ui.vertical(|ui| {
+                            ui.add_sized(
+                                [key_w, ctrl_h],
+                                TextEdit::singleline(&mut row.key)
+                                    .id_salt(("k", i))
+                                    .font(egui::TextStyle::Monospace)
+                                    .hint_text("key")
+                                    .margin(th.text_edit_margin()),
+                            );
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = th.spacing.sm;
-                                ui.set_height(row_h);
-                                ui.add_sized(
-                                    [key_w, ctrl_h],
-                                    TextEdit::singleline(&mut row.key)
-                                        .id_salt(("k", i))
-                                        .font(egui::TextStyle::Monospace)
-                                        .hint_text("key")
-                                        .margin(th.text_edit_margin()),
-                                );
                                 ui.add_sized(
                                     [val_w, ctrl_h],
                                     TextEdit::singleline(&mut row.value)
@@ -1139,45 +1467,118 @@ impl BaoGuiApp {
                                     remove_idx = Some(i);
                                 }
                             });
-                        }
-                    });
-
-                if let Some(i) = remove_idx {
-                    self.kv_rows.remove(i);
-                }
-                if let Some(v) = copy_val {
-                    ctx.copy_text(v);
-                    self.show_toast("Value copied");
+                        });
+                        ui.add_space(th.spacing.xs);
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = th.spacing.sm;
+                            ui.set_height(row_h);
+                            ui.add_sized(
+                                [key_w, ctrl_h],
+                                TextEdit::singleline(&mut row.key)
+                                    .id_salt(("k", i))
+                                    .font(egui::TextStyle::Monospace)
+                                    .hint_text("key")
+                                    .margin(th.text_edit_margin()),
+                            );
+                            ui.add_sized(
+                                [val_w, ctrl_h],
+                                TextEdit::singleline(&mut row.value)
+                                    .id_salt(("v", i))
+                                    .password(!reveal)
+                                    .font(egui::TextStyle::Monospace)
+                                    .hint_text("value")
+                                    .margin(th.text_edit_margin()),
+                            );
+                            if icon_button(ui, th, Icon::Copy, "Copy value").clicked() {
+                                copy_val = Some(row.value.clone());
+                            }
+                            if ui
+                                .add_sized([ctrl_h, ctrl_h], egui::Button::new("×"))
+                                .on_hover_text("Remove key")
+                                .clicked()
+                            {
+                                remove_idx = Some(i);
+                            }
+                        });
+                    }
                 }
             });
+
+        if let Some(i) = remove_idx {
+            self.kv_rows.remove(i);
+        }
+        if let Some(v) = copy_val {
+            ctx.copy_text(v);
+            self.show_toast("Value copied");
+        }
     }
 
-    fn ui_search_results(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, th: &Theme) {
+    fn ui_search_results(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        th: &Theme,
+        compact: bool,
+    ) {
+        let narrow = compact || ui.available_width() < NARROW_PANE;
         let n = self.search_hits.len();
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                title_2(ui, th, "Search results");
-                dim_label(
-                    ui,
-                    th,
-                    &format!(
-                        "{n} matching key/value pair{} across {}/",
-                        if n == 1 { "" } else { "s" },
-                        self.mount
-                    ),
-                );
-            });
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let label = if self.reveal_values {
-                    "Hide values"
-                } else {
-                    "Show values"
-                };
-                if button(ui, th, label).clicked() {
-                    self.reveal_values = !self.reveal_values;
-                }
-            });
-        });
+        let reveal_label = if self.reveal_values {
+            if narrow {
+                "Hide"
+            } else {
+                "Hide values"
+            }
+        } else if narrow {
+            "Values"
+        } else {
+            "Show values"
+        };
+        let mut toggle_reveal = false;
+
+        if narrow {
+            title_2(ui, th, "Search results");
+            dim_label(
+                ui,
+                th,
+                &format!(
+                    "{n} match{} in {}/",
+                    if n == 1 { "" } else { "es" },
+                    self.mount
+                ),
+            );
+            ui.add_space(th.spacing.xs);
+            if button(ui, th, reveal_label).clicked() {
+                toggle_reveal = true;
+            }
+        } else {
+            let mount = self.mount.clone();
+            lead_trail(
+                ui,
+                |ui| {
+                    ui.vertical(|ui| {
+                        title_2(ui, th, "Search results");
+                        dim_label(
+                            ui,
+                            th,
+                            &format!(
+                                "{n} matching key/value pair{} across {}/",
+                                if n == 1 { "" } else { "s" },
+                                mount
+                            ),
+                        );
+                    });
+                },
+                |ui| {
+                    if button(ui, th, reveal_label).clicked() {
+                        toggle_reveal = true;
+                    }
+                },
+            );
+        }
+        if toggle_reveal {
+            self.reveal_values = !self.reveal_values;
+        }
 
         ui.add_space(th.spacing.md);
         ui.separator();
@@ -1198,69 +1599,141 @@ impl BaoGuiApp {
 
         let hits = self.search_hits.clone();
         let reveal = self.reveal_values;
-        let cols = [
-            Col {
-                header: "Path",
-                kind: ColKind::Flex,
-            },
-            Col {
-                header: "Key",
-                kind: ColKind::Flex,
-            },
-            Col {
-                header: "Value",
-                kind: ColKind::Flex,
-            },
-        ];
-
         let mut open_path: Option<String> = None;
         let mut copy_val: Option<String> = None;
 
-        ScrollArea::both()
-            .id_salt("search_hits")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                data_table(ui, th, "search_hits_table", &cols, |ui, i| {
-                    let hit = &hits[i];
-                    let path_resp = ui.add(
-                        egui::Label::new(
-                            RichText::new(&hit.path)
-                                .size(th.type_scale.body)
-                                .monospace()
-                                .color(th.palette.accent),
-                        )
-                        .sense(egui::Sense::click()),
-                    );
-                    if path_resp.clicked() {
-                        open_path = Some(hit.path.clone());
+        if narrow {
+            ScrollArea::vertical()
+                .id_salt("search_hits_compact")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for hit in &hits {
+                        let mut open = false;
+                        let mut copy = false;
+                        card(ui, th, |ui| {
+                            let path_resp = ui.add(
+                                egui::Label::new(
+                                    RichText::new(&hit.path)
+                                        .size(th.type_scale.body)
+                                        .monospace()
+                                        .color(th.palette.accent),
+                                )
+                                .wrap()
+                                .sense(egui::Sense::click()),
+                            );
+                            if path_resp.clicked() {
+                                open = true;
+                            }
+                            path_resp.on_hover_text("Open secret");
+                            ui.add_space(th.spacing.xs);
+                            ui.label(
+                                RichText::new(&hit.key)
+                                    .size(th.type_scale.caption)
+                                    .color(th.palette.text_secondary)
+                                    .monospace(),
+                            );
+                            let shown = if reveal {
+                                hit.value.as_str()
+                            } else {
+                                "••••••••"
+                            };
+                            ui.horizontal(|ui| {
+                                let val_resp = ui.add(
+                                    egui::Label::new(
+                                        RichText::new(shown)
+                                            .size(th.type_scale.body)
+                                            .monospace()
+                                            .color(th.palette.text),
+                                    )
+                                    .wrap()
+                                    .sense(egui::Sense::click()),
+                                );
+                                if val_resp.clicked() {
+                                    copy = true;
+                                }
+                                val_resp.on_hover_text("Copy value");
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if icon_button(ui, th, Icon::Copy, "Copy value").clicked() {
+                                        copy = true;
+                                    }
+                                });
+                            });
+                        });
+                        if open {
+                            open_path = Some(hit.path.clone());
+                        }
+                        if copy {
+                            copy_val = Some(hit.value.clone());
+                        }
+                        ui.add_space(th.spacing.sm);
                     }
-                    if path_resp.hovered() {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                    }
-                    path_resp.on_hover_text("Open secret");
+                });
+        } else {
+            let cols = [
+                Col {
+                    header: "Path",
+                    kind: ColKind::Flex,
+                },
+                Col {
+                    header: "Key",
+                    kind: ColKind::Flex,
+                },
+                Col {
+                    header: "Value",
+                    kind: ColKind::Flex,
+                },
+            ];
 
-                    table_text(ui, th, &hit.key, true);
+            ScrollArea::both()
+                .id_salt("search_hits")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    data_table(ui, th, "search_hits_table", &cols, |ui, i| {
+                        let hit = &hits[i];
+                        let path_resp = ui
+                            .add(
+                                egui::Label::new(
+                                    RichText::new(&hit.path)
+                                        .size(th.type_scale.body)
+                                        .monospace()
+                                        .color(th.palette.accent),
+                                )
+                                .truncate()
+                                .sense(egui::Sense::click()),
+                            )
+                            .on_hover_text(&hit.path);
+                        if path_resp.clicked() {
+                            open_path = Some(hit.path.clone());
+                        }
+                        if path_resp.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
 
-                    let shown = if reveal {
-                        hit.value.as_str()
-                    } else {
-                        "••••••••"
-                    };
-                    let val_resp = ui.add(
-                        egui::Label::new(
-                            RichText::new(shown)
-                                .size(th.type_scale.body)
-                                .monospace()
-                                .color(th.palette.text),
-                        )
-                        .sense(egui::Sense::click()),
-                    );
-                    if val_resp.clicked() {
-                        copy_val = Some(hit.value.clone());
-                    }
-                    val_resp.on_hover_text("Copy value");
-                }, n);
-            });
+                        table_text(ui, th, &hit.key, true);
+
+                        let shown = if reveal {
+                            hit.value.as_str()
+                        } else {
+                            "••••••••"
+                        };
+                        let val_resp = ui
+                            .add(
+                                egui::Label::new(
+                                    RichText::new(shown)
+                                        .size(th.type_scale.body)
+                                        .monospace()
+                                        .color(th.palette.text),
+                                )
+                                .truncate()
+                                .sense(egui::Sense::click()),
+                            )
+                            .on_hover_text(if reveal { shown } else { "Copy value" });
+                        if val_resp.clicked() {
+                            copy_val = Some(hit.value.clone());
+                        }
+                    }, n);
+                });
+        }
 
         if let Some(path) = open_path {
             self.open_secret_at_path(&path);
