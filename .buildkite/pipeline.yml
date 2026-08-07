@@ -1,6 +1,11 @@
 # Buildkite CI for Radicle Garden (buildkite-adapter).
 # Mirrors .github/workflows/ci.yml "check" job. Agents must reach
 # https://nandi.radicle.garden/{rid}.git and https://tangled.org/nandi.uk/vidya.
+# Author email must match a verified Buildkite personal email (or GitHub-linked noreply).
+# Hosted queue key: auto (LINUX_AMD64_2X4).
+
+agents:
+  queue: auto
 
 env:
   RUST_BACKTRACE: "1"
