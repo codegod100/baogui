@@ -3,6 +3,7 @@
 # https://nandi.radicle.garden/{rid}.git and https://tangled.org/nandi.uk/vidya.
 # Author email must match a verified Buildkite personal email (or GitHub-linked noreply).
 # Hosted queue key: auto (LINUX_AMD64_2X4).
+# Use $$ so Buildkite does not interpolate shell vars at pipeline-upload time.
 
 agents:
   queue: auto
@@ -17,16 +18,16 @@ steps:
       set -euo pipefail
 
       # Path dep: vidya lives next to this checkout.
-      vidya_dir="$(dirname "$PWD")/vidya"
-      if [[ ! -d "$vidya_dir/.git" && ! -f "$vidya_dir/Cargo.toml" ]]; then
-        git clone --depth 1 https://tangled.org/nandi.uk/vidya "$vidya_dir"
+      vidya_dir="$$(dirname "$$PWD")/vidya"
+      if [[ ! -d "$$vidya_dir/.git" && ! -f "$$vidya_dir/Cargo.toml" ]]; then
+        git clone --depth 1 https://tangled.org/nandi.uk/vidya "$$vidya_dir"
       fi
 
       if ! command -v rustup >/dev/null 2>&1; then
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
           | sh -s -- -y --default-toolchain 1.85
         # shellcheck disable=SC1091
-        source "$HOME/.cargo/env"
+        source "$$HOME/.cargo/env"
       fi
       rustup toolchain install 1.85 --profile minimal --component clippy
       rustup default 1.85
