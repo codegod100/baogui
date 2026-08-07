@@ -1,18 +1,25 @@
 # Buildkite CI for Radicle Garden (buildkite-adapter).
-# Mirrors .github/workflows/ci.yml "check" + optional APK artifact upload,
+# Mirrors .github/workflows/ci.yml "check" + optional nixbuild APK,
 # plus Flatpak desktop/Wayland bundle (org.openbao.baogui.flatpak).
 #
 # Artifacts:
-#   - Flatpak: flatpak-builder → org.openbao.baogui.flatpak (always attempted)
-#   - APK: nix build .#android when nixbuild credentials exist
+#   - Flatpak: flatpak-builder in privileged Docker → org.openbao.baogui.flatpak
+#   - APK: nix build .#android on nixbuild.net (ssh-ng:// → eu.nixbuild.net)
+#   - Nix desktop package .#baogui is also built on nixbuild (verify only;
+#     Flatpak remains the desktop download — no naked ELF upload)
 # Do NOT upload a naked cargo release binary (NoWaylandLib on plain Linux).
 #
 # Secrets (Buildkite cluster → Secrets, org nandi / Default cluster):
-#   - NIXBUILD_TOKEN (preferred for APK) — soft-loaded via buildkite-agent secret get
+#   - NIXBUILD_TOKEN (preferred for nix builds) — soft-loaded via
+#     buildkite-agent secret get; never printed. Required for APK / nix package.
 #   - OPENBAO_TOKEN (optional) — if set, scripts/fetch-openbao-env.sh reads
 #     secret/data/ai-api-keys → NIXBUILD_TOKEN (same as GitHub Actions)
 # UI: https://buildkite.com/organizations/nandi/clusters → Default cluster → Secrets
 # Pipeline: https://buildkite.com/nandi/baogui-aopjch
+#
+# Nix+nixbuild setup: scripts/ci-nixbuild.sh (mirrors nixbuild-action:
+# trusted-public-keys, ssh://nixbuild substituter, builders-use-substitutes,
+# remote-store builds per https://docs.nixbuild.net/remote-builds/).
 #
 # Agents must reach https://nandi.radicle.garden/{rid}.git and
 # https://tangled.org/nandi.uk/vidya, plus Flathub for Flatpak SDK/runtime.
@@ -109,7 +116,7 @@ steps:
 
       buildkite-agent artifact upload org.openbao.baogui.flatpak
 
-  - label: ":android: APK"
+  - label: ":android: APK + nix (nixbuild.net)"
     key: apk
     depends_on: check
     timeout_in_minutes: 120
@@ -117,220 +124,45 @@ steps:
     command: |
       set -euo pipefail
 
-      echo "--- :lock: Resolve nixbuild credentials"
-      # Soft-load Buildkite cluster secrets when not already in the job env.
-      if command -v buildkite-agent >/dev/null 2>&1; then
-        if [[ -z "$${NIXBUILD_TOKEN:-}" ]]; then
-          if nt="$$(buildkite-agent secret get NIXBUILD_TOKEN 2>/dev/null || true)"; then
-            if [[ -n "$$nt" ]]; then
-              export NIXBUILD_TOKEN="$$nt"
-              echo "Loaded NIXBUILD_TOKEN from Buildkite secret"
-            fi
-          fi
-        else
-          echo "NIXBUILD_TOKEN already present in job env"
-        fi
-        if [[ -z "$${OPENBAO_TOKEN:-}" ]]; then
-          if ot="$$(buildkite-agent secret get OPENBAO_TOKEN 2>/dev/null || true)"; then
-            if [[ -n "$$ot" ]]; then
-              export OPENBAO_TOKEN="$$ot"
-              echo "Loaded OPENBAO_TOKEN from Buildkite secret"
-            fi
-          fi
-        fi
-      fi
+      chmod +x scripts/ci-nixbuild.sh scripts/fetch-openbao-env.sh
 
-      # Prefer Buildkite secret NIXBUILD_TOKEN; else OPENBAO_TOKEN → fetch from OpenBao
-      # (same path as .github/workflows/ci.yml).
-      if [[ -z "$${NIXBUILD_TOKEN:-}" && -n "$${OPENBAO_TOKEN:-}" ]]; then
-        echo "Fetching NIXBUILD_TOKEN from OpenBao via OPENBAO_TOKEN"
-        chmod +x scripts/fetch-openbao-env.sh
-        # shellcheck disable=SC1091
-        eval "$$(./scripts/fetch-openbao-env.sh --export --keys NIXBUILD_TOKEN)"
-      fi
-
-      if [[ -z "$${NIXBUILD_TOKEN:-}" ]]; then
-        echo "--- :warning: Skipping APK (no nixbuild credentials)"
-        echo "NIXBUILD_TOKEN and OPENBAO_TOKEN are both unset in this job."
-        echo "Create a Buildkite cluster secret (do not invent tokens — copy from OpenBao/nixbuild):"
-        echo "  UI: https://buildkite.com/organizations/nandi/clusters → Default cluster → Secrets"
-        echo "  Keys: NIXBUILD_TOKEN  (preferred)  or  OPENBAO_TOKEN  (fetches NIXBUILD_TOKEN from OpenBao)"
-        echo "  Scope policy example: pipeline_slug baogui-aopjch"
+      creds_out="$$(mktemp)"
+      ./scripts/ci-nixbuild.sh resolve-creds | tee "$$creds_out"
+      # shellcheck disable=SC1090
+      eval "$$(grep -E '^(SKIP|NIXBUILD_CREDS_ENV)=' "$$creds_out")"
+      if [[ "$${SKIP:-1}" == "1" ]]; then
+        echo "--- :warning: Skipping nixbuild jobs (no nixbuild credentials)"
         echo "Desktop Flatpak is built in the Flatpak step (org.openbao.baogui.flatpak)."
         exit 0
       fi
+      # shellcheck disable=SC1090
+      source "$$NIXBUILD_CREDS_ENV"
 
-      echo "NIXBUILD_TOKEN is set — building APK via nixbuild.net"
-      # nixbuild-action uses NIXBUILDNET_TOKEN (+ legacy SetEnv token=).
-      export NIXBUILDNET_TOKEN="$${NIXBUILD_TOKEN}"
-
-      if ! command -v nix >/dev/null 2>&1; then
-        curl --proto '=https' --tlsv1.2 -sSf -L \
-          https://install.determinate.systems/nix \
-          | sh -s -- install linux --no-confirm --init none
-        # shellcheck disable=SC1091
-        . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh || true
-        export PATH="/nix/var/nix/profiles/default/bin:$$PATH"
-      fi
-      command -v nix >/dev/null 2>&1 || {
-        echo "nix not on PATH after install" >&2
+      setup_out="$$(mktemp)"
+      ./scripts/ci-nixbuild.sh setup | tee "$$setup_out"
+      setup_env="$$(sed -n 's/^NIXBUILD_SETUP_ENV=//p' "$$setup_out" | tail -1)"
+      [[ -n "$$setup_env" && -f "$$setup_env" ]] || {
+        echo "ci-nixbuild setup did not emit NIXBUILD_SETUP_ENV" >&2
         exit 1
       }
-      if ! command -v jq >/dev/null 2>&1; then
-        if command -v apt-get >/dev/null 2>&1; then
-          sudo DEBIAN_FRONTEND=noninteractive apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y jq
-        fi
-      fi
-      command -v jq >/dev/null 2>&1 || {
-        echo "jq required to read nixbuild signing key" >&2
-        exit 1
-      }
+      # shellcheck disable=SC1090
+      source "$$setup_env"
 
-      # Mirror nixbuild/nixbuild-action SSH + builders setup so the daemon
-      # (root) and the job user share the same authtoken config.
-      # Write /etc/nix *before* starting the daemon (no restart / pgrep — that
-      # previously SIGTERM'd the Buildkite job).
-      ssh_known_hosts="$$(mktemp)"
-      ssh_config="$$(mktemp)"
-      builders_file="$$(mktemp)"
-      echo 'eu.nixbuild.net ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPIQCZc54poJ8vqawd8TraNryQeJnvH1eLpIDgbiqymM' >"$$ssh_known_hosts"
-      echo 'nixbuild ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPIQCZc54poJ8vqawd8TraNryQeJnvH1eLpIDgbiqymM' >>"$$ssh_known_hosts"
-      {
-        echo 'Host nixbuild eu.nixbuild.net'
-        echo '  HostName eu.nixbuild.net'
-        echo '  HostKeyAlias nixbuild'
-        echo '  LogLevel ERROR'
-        echo '  StrictHostKeyChecking yes'
-        echo "  UserKnownHostsFile $$ssh_known_hosts"
-        echo '  ControlPath none'
-        echo '  ServerAliveInterval 60'
-        echo '  IPQoS throughput'
-        echo '  PreferredAuthentications none'
-        echo '  User authtoken'
-        echo '  SendEnv NIXBUILDNET_TOKEN'
-        # Legacy + documented token env (docs.nixbuild.net/access-control).
-        echo "  SetEnv NIXBUILDNET_TOKEN=$${NIXBUILDNET_TOKEN} token=$${NIXBUILDNET_TOKEN}"
-      } >"$$ssh_config"
-      chmod 600 "$$ssh_config" "$$ssh_known_hosts"
-      export NIX_SSHOPTS="-F$$ssh_config"
-
-      # Also install for root so nix-daemon remote builds authenticate.
-      sudo mkdir -p /root/.ssh
-      sudo cp "$$ssh_config" /root/.ssh/config
-      sudo cp "$$ssh_known_hosts" /root/.ssh/known_hosts
-      sudo chmod 700 /root/.ssh
-      sudo chmod 600 /root/.ssh/config /root/.ssh/known_hosts
-
-      # Verify authtoken SSH before spending build hours (signing-key fetch = liveness).
-      echo "--- :nixbuild: fetch signing key"
-      nixbuild_pubkey="$$(
-        ssh -F "$$ssh_config" nixbuild api settings signing-key-for-builds --show \
-          | jq -r '"\(.keyName):\(.publicKey)"'
-      )"
-      [[ -n "$$nixbuild_pubkey" && "$$nixbuild_pubkey" != ":" ]] || {
-        echo "failed to read nixbuild signing key (SSH/auth problem?)" >&2
-        exit 1
-      }
-      echo "nixbuild substituter pubkey: $${nixbuild_pubkey%%:*}"
-
-      # i686 needed for Android SDK (ncurses-abi5-compat); keep concurrency modest
-      # to avoid SSH EOF storms on hosted agents.
-      {
-        echo 'nixbuild x86_64-linux - 32 1 big-parallel,benchmark,kvm,nixos-test,ca-derivations'
-        echo 'nixbuild aarch64-linux - 32 1 big-parallel,benchmark,kvm,nixos-test,ca-derivations'
-        echo 'nixbuild i686-linux - 32 1 big-parallel,benchmark,kvm,nixos-test,ca-derivations'
-      } >"$$builders_file"
-
-      # Multi-user nix-daemon only trusts keys from *system* nix.conf.
-      # User ~/.config/nix or NIX_CONFIG extra-trusted-public-keys are ignored
-      # (hence "not signed by any of the keys in trusted-public-keys").
-      # Put builders + keys under /etc/nix (root-readable) like nixbuild-action's
-      # NIX_CONFIG include, but durable for the daemon.
-      sudo mkdir -p /etc/nix
-      sudo cp "$$builders_file" /etc/nix/baogui-nixbuild-builders
-      sudo chmod 644 /etc/nix/baogui-nixbuild-builders
-      {
-        echo 'experimental-features = nix-command flakes'
-        echo 'accept-flake-config = true'
-        echo 'builders-use-substitutes = true'
-        echo 'require-sigs = true'
-        echo 'max-jobs = 0'
-        echo 'builders = @/etc/nix/baogui-nixbuild-builders'
-        echo 'extra-substituters = ssh://nixbuild?priority=100'
-        echo "extra-trusted-public-keys = $$nixbuild_pubkey"
-        # Also set trusted-public-keys append-style via extra-*; some installs
-        # only honor trusted-* when written in the daemon's conf itself.
-      } | sudo tee /etc/nix/baogui-nixbuild.conf >/dev/null
-      sudo chmod 644 /etc/nix/baogui-nixbuild.conf
-
-      # Ensure system nix.conf includes our snippet (idempotent).
-      if ! sudo grep -q 'baogui-nixbuild.conf' /etc/nix/nix.conf 2>/dev/null; then
-        echo 'include /etc/nix/baogui-nixbuild.conf' | sudo tee -a /etc/nix/nix.conf >/dev/null
-      fi
-      # Determinate may already list cache.nixos.org keys; append nixbuild explicitly
-      # in case include order / trusted-user rules drop extra-* from includes.
-      if ! sudo grep -qF "$$nixbuild_pubkey" /etc/nix/nix.conf 2>/dev/null; then
-        echo "extra-trusted-public-keys = $$nixbuild_pubkey" | sudo tee -a /etc/nix/nix.conf >/dev/null
-      fi
-      if ! sudo grep -q 'ssh://nixbuild' /etc/nix/nix.conf 2>/dev/null; then
-        echo 'extra-substituters = ssh://nixbuild?priority=100' | sudo tee -a /etc/nix/nix.conf >/dev/null
-      fi
-
-      mkdir -p "$$HOME/.config/nix"
-      sudo cp /etc/nix/baogui-nixbuild.conf "$$HOME/.config/nix/nix.conf"
-      export NIX_CONFIG="include /etc/nix/baogui-nixbuild.conf"
-
-      # --init none leaves no systemd unit; start daemon *after* system conf
-      # so trusted-public-keys / substituters are loaded on first boot.
-      if [[ ! -S /nix/var/nix/daemon-socket/socket ]]; then
-        echo "Starting nix-daemon with nixbuild trusted keys"
-        sudo /nix/var/nix/profiles/default/bin/nix daemon >/tmp/nix-daemon.log 2>&1 &
-        for _ in $$(seq 1 30); do
-          [[ -S /nix/var/nix/daemon-socket/socket ]] && break
-          sleep 1
-        done
-        [[ -S /nix/var/nix/daemon-socket/socket ]] || {
-          echo "nix-daemon socket missing after start; log:" >&2
-          cat /tmp/nix-daemon.log >&2 || true
-          exit 1
-        }
-      else
-        echo "nix-daemon already running (socket present)"
-      fi
-
-      # Show effective trusted key *names* (not key material) for the build log.
-      echo "--- :nix: show-config trusted key names"
-      nix show-config 2>/dev/null | awk -F' = ' '/^trusted-public-keys =/{print; exit}' \
-        | tr ' ' '\n' | awk -F: 'NF{print "trusted-key:", $$1}' || true
-      nix show-config 2>/dev/null | grep -E '^(substituters|extra-substituters|builders) =' || true
-
-      # CI-recommended path (docs.nixbuild.net/remote-builds): build in the
-      # nixbuild remote store, then copy the APK closure back. Avoids cold-agent
-      # local-store "unexpectedly invalid" / unsigned-substitute noise from
-      # treating ssh://nixbuild as a local substituter for unsigned paths.
-      echo "--- :nix: nix build .#android (ssh-ng remote store)"
-      out_json="$$(mktemp)"
-      nix build \
-        --builders '' \
-        --max-jobs 1 \
-        --eval-store auto \
-        --store ssh-ng://nixbuild \
-        ".#android" -L --print-build-logs --json | tee "$$out_json"
-      out_path="$$(jq -r '.[0].outputs.out // empty' "$$out_json")"
-      [[ -n "$$out_path" ]] || {
-        echo "nix build produced no out path; json:" >&2
-        cat "$$out_json" >&2 || true
-        exit 1
-      }
-      echo "Copying $$out_path from nixbuild → local store"
-      nix copy --from ssh-ng://nixbuild "$$out_path"
-      ln -sfn "$$out_path" result-android
-
+      # APK artifact (same as GHA nix build .#android after nixbuild-action).
+      ./scripts/ci-nixbuild.sh remote-build ".#android" result-android
       [[ -f result-android/baogui.apk ]] || {
         echo "APK missing under result-android/" >&2
         ls -la result-android >&2 || true
         exit 1
       }
-
       buildkite-agent artifact upload result-android/baogui.apk
+
+      # Optional: verify flake desktop package on nixbuild (no ELF upload).
+      echo "--- :nix: verify .#baogui on nixbuild"
+      ./scripts/ci-nixbuild.sh remote-build ".#baogui" result-baogui
+      [[ -x result-baogui/bin/baogui ]] || {
+        echo "nix package missing bin/baogui" >&2
+        ls -la result-baogui >&2 || true
+        exit 1
+      }
+      echo "nix package .#baogui OK (not uploaded; use Flatpak for desktop artifact)"

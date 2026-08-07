@@ -85,11 +85,11 @@ cargo test live_read -- --ignored --nocapture
 
 | Package | Status | How to get / run |
 |---------|--------|------------------|
-| **APK** | Built by CI (`nix build .#android`) | Download `baogui.apk` from GitHub Actions or Buildkite (needs `NIXBUILD_TOKEN` / `OPENBAO_TOKEN`). Install on device / Waydroid / emulator. |
+| **APK** | Built by CI on [nixbuild.net](https://nixbuild.net) (`nix build .#android` via `ssh-ng`) | Download `baogui.apk` from GitHub Actions or Buildkite (needs `NIXBUILD_TOKEN` / `OPENBAO_TOKEN`). Install on device / Waydroid / emulator. |
 | **Flatpak** | Manifest + CI bundle | `flatpak/org.openbao.baogui.yml` — Wayland runtime ships libs. Download `org.openbao.baogui.flatpak` from Buildkite, or build locally (below). |
-| **Nix desktop** | Local / flake | `nix run` or `nix build .#baogui` — wraps with Wayland/`LD_LIBRARY_PATH` from nixpkgs. |
+| **Nix desktop** | Local / flake (CI verifies on nixbuild) | `nix run` or `nix build .#baogui` — wraps with Wayland/`LD_LIBRARY_PATH` from nixpkgs. |
 
-Buildkite (`.buildkite/pipeline.yml`) runs host check always, then Flatpak bundle upload, then APK upload when secrets exist. Cluster secrets live under [nandi → Default cluster → Secrets](https://buildkite.com/organizations/nandi/clusters): **`NIXBUILD_TOKEN`** (preferred) or **`OPENBAO_TOKEN`** (fetches `NIXBUILD_TOKEN` from OpenBao, same as GHA). Pipeline: [baogui-aopjch](https://buildkite.com/nandi/baogui-aopjch). It does **not** publish a raw `target/release/baogui` ELF (that fails with `NoWaylandLib` without system Wayland libs / wrong glibc).
+Buildkite (`.buildkite/pipeline.yml`) runs host check always, then Flatpak bundle upload, then nixbuild.net jobs when secrets exist: APK upload + `.#baogui` verify (`scripts/ci-nixbuild.sh`). Cluster secrets live under [nandi → Default cluster → Secrets](https://buildkite.com/organizations/nandi/clusters): **`NIXBUILD_TOKEN`** (preferred) or **`OPENBAO_TOKEN`** (fetches `NIXBUILD_TOKEN` from OpenBao, same as GHA). Soft-skip with a clear log when neither is set; the token is never printed. Pipeline: [baogui-aopjch](https://buildkite.com/nandi/baogui-aopjch). It does **not** publish a raw `target/release/baogui` ELF (that fails with `NoWaylandLib` without system Wayland libs / wrong glibc).
 
 ### Flatpak (local)
 

@@ -35,11 +35,12 @@ nix build .#baogui      # pure package (stages flake input vidya)
 App id / desktop icon: `org.openbao.baogui`.
 
 Buildkite (`.buildkite/pipeline.yml`): host `cargo clippy`/`test`, Flatpak bundle
-(`flatpak/org.openbao.baogui.yml` → `org.openbao.baogui.flatpak`), then optional APK
-(`nix build .#android` → artifact) when cluster secret `NIXBUILD_TOKEN` or
-`OPENBAO_TOKEN` is set (UI: org `nandi` → Default cluster → Secrets; pipeline
-`baogui-aopjch`). Do not upload a naked Linux ELF — use Flatpak or `nix run` /
-`nix build .#baogui`.
+(`flatpak/org.openbao.baogui.yml` → `org.openbao.baogui.flatpak`), then optional
+nixbuild.net jobs via `scripts/ci-nixbuild.sh` when cluster secret
+`NIXBUILD_TOKEN` or `OPENBAO_TOKEN` is set: APK (`nix build .#android` on
+`ssh-ng://nixbuild` → `eu.nixbuild.net`) + verify `.#baogui` (UI: org `nandi` →
+Default cluster → Secrets; pipeline `baogui-aopjch`). Do not upload a naked Linux
+ELF — use Flatpak or `nix run` / `nix build .#baogui`.
 
 ## Cursor Cloud specific instructions
 
