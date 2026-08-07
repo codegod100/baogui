@@ -46,11 +46,11 @@
     "vidya": {
       "flake": false,
       "locked": {
-        "lastModified": 1785634073,
-        "narHash": "sha256-3lRMABykdWy7ZkHWzR7r+KhLq8QABsGY4SNGG/MARpA=",
+        "lastModified": 1786105816,
+        "narHash": "sha256-hs4oHwnNO1icb7ZqotXrRkKBPg9ZzqEGG5dfvxcRtG8=",
         "ref": "refs/heads/main",
-        "rev": "c50fcb45a22116c48b787230b295db202a1761fc",
-        "revCount": 23,
+        "rev": "a180af5434d7a9fca5699c49548b45a4acb18c54",
+        "revCount": 24,
         "type": "git",
         "url": "https://tangled.org/nandi.uk/vidya"
       },
