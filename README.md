@@ -89,7 +89,7 @@ cargo test live_read -- --ignored --nocapture
 | **Flatpak** | Manifest + CI bundle | `flatpak/org.openbao.baogui.yml` — Wayland runtime ships libs. Download `org.openbao.baogui.flatpak` from Buildkite, or build locally (below). |
 | **Nix desktop** | Local / flake | `nix run` or `nix build .#baogui` — wraps with Wayland/`LD_LIBRARY_PATH` from nixpkgs. |
 
-Buildkite (`.buildkite/pipeline.yml`) runs host check always, then Flatpak bundle upload, then APK upload when secrets exist. It does **not** publish a raw `target/release/baogui` ELF (that fails with `NoWaylandLib` without system Wayland libs / wrong glibc).
+Buildkite (`.buildkite/pipeline.yml`) runs host check always, then Flatpak bundle upload, then APK upload when secrets exist. Cluster secrets live under [nandi → Default cluster → Secrets](https://buildkite.com/organizations/nandi/clusters): **`NIXBUILD_TOKEN`** (preferred) or **`OPENBAO_TOKEN`** (fetches `NIXBUILD_TOKEN` from OpenBao, same as GHA). Pipeline: [baogui-aopjch](https://buildkite.com/nandi/baogui-aopjch). It does **not** publish a raw `target/release/baogui` ELF (that fails with `NoWaylandLib` without system Wayland libs / wrong glibc).
 
 ### Flatpak (local)
 

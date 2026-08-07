@@ -7,8 +7,12 @@
 #   - APK: nix build .#android when nixbuild credentials exist
 # Do NOT upload a naked cargo release binary (NoWaylandLib on plain Linux).
 #
-# Secrets (Buildkite pipeline/org env): NIXBUILD_TOKEN, or OPENBAO_TOKEN that
-# can read secret/data/ai-api-keys → NIXBUILD_TOKEN (same as GitHub Actions).
+# Secrets (Buildkite cluster → Secrets, org nandi / Default cluster):
+#   - NIXBUILD_TOKEN (preferred for APK) — soft-loaded via buildkite-agent secret get
+#   - OPENBAO_TOKEN (optional) — if set, scripts/fetch-openbao-env.sh reads
+#     secret/data/ai-api-keys → NIXBUILD_TOKEN (same as GitHub Actions)
+# UI: https://buildkite.com/organizations/nandi/clusters → Default cluster → Secrets
+# Pipeline: https://buildkite.com/nandi/baogui-aopjch
 #
 # Agents must reach https://nandi.radicle.garden/{rid}.git and
 # https://tangled.org/nandi.uk/vidya, plus Flathub for Flatpak SDK/runtime.
@@ -99,23 +103,55 @@ steps:
   - label: ":android: APK"
     key: apk
     depends_on: check
+    timeout_in_minutes: 120
+    # Prefer soft get (missing secret → skip) over YAML `secrets:` (missing key fails the job).
     command: |
       set -euo pipefail
+
+      echo "--- :lock: Resolve nixbuild credentials"
+      # Soft-load Buildkite cluster secrets when not already in the job env.
+      if command -v buildkite-agent >/dev/null 2>&1; then
+        if [[ -z "$${NIXBUILD_TOKEN:-}" ]]; then
+          if nt="$$(buildkite-agent secret get NIXBUILD_TOKEN 2>/dev/null || true)"; then
+            if [[ -n "$$nt" ]]; then
+              export NIXBUILD_TOKEN="$$nt"
+              echo "Loaded NIXBUILD_TOKEN from Buildkite secret"
+            fi
+          fi
+        else
+          echo "NIXBUILD_TOKEN already present in job env"
+        fi
+        if [[ -z "$${OPENBAO_TOKEN:-}" ]]; then
+          if ot="$$(buildkite-agent secret get OPENBAO_TOKEN 2>/dev/null || true)"; then
+            if [[ -n "$$ot" ]]; then
+              export OPENBAO_TOKEN="$$ot"
+              echo "Loaded OPENBAO_TOKEN from Buildkite secret"
+            fi
+          fi
+        fi
+      fi
 
       # Prefer Buildkite secret NIXBUILD_TOKEN; else OPENBAO_TOKEN → fetch from OpenBao
       # (same path as .github/workflows/ci.yml).
       if [[ -z "$${NIXBUILD_TOKEN:-}" && -n "$${OPENBAO_TOKEN:-}" ]]; then
+        echo "Fetching NIXBUILD_TOKEN from OpenBao via OPENBAO_TOKEN"
         chmod +x scripts/fetch-openbao-env.sh
         # shellcheck disable=SC1091
         eval "$$(./scripts/fetch-openbao-env.sh --export --keys NIXBUILD_TOKEN)"
       fi
 
       if [[ -z "$${NIXBUILD_TOKEN:-}" ]]; then
-        echo "--- :warning: Skipping APK (no NIXBUILD_TOKEN / OPENBAO_TOKEN)"
-        echo "Set Buildkite secret NIXBUILD_TOKEN (or OPENBAO_TOKEN for OpenBao fetch)."
+        echo "--- :warning: Skipping APK (no nixbuild credentials)"
+        echo "NIXBUILD_TOKEN and OPENBAO_TOKEN are both unset in this job."
+        echo "Create a Buildkite cluster secret (do not invent tokens — copy from OpenBao/nixbuild):"
+        echo "  UI: https://buildkite.com/organizations/nandi/clusters → Default cluster → Secrets"
+        echo "  Keys: NIXBUILD_TOKEN  (preferred)  or  OPENBAO_TOKEN  (fetches NIXBUILD_TOKEN from OpenBao)"
+        echo "  Scope policy example: pipeline_slug baogui-aopjch"
         echo "Desktop Flatpak is built in the Flatpak step (org.openbao.baogui.flatpak)."
         exit 0
       fi
+
+      echo "NIXBUILD_TOKEN is set — building APK via nixbuild.net"
 
       if ! command -v nix >/dev/null 2>&1; then
         curl --proto '=https' --tlsv1.2 -sSf -L \

@@ -36,8 +36,10 @@ App id / desktop icon: `org.openbao.baogui`.
 
 Buildkite (`.buildkite/pipeline.yml`): host `cargo clippy`/`test`, Flatpak bundle
 (`flatpak/org.openbao.baogui.yml` → `org.openbao.baogui.flatpak`), then optional APK
-(`nix build .#android` → artifact) when `NIXBUILD_TOKEN` or `OPENBAO_TOKEN` is set.
-Do not upload a naked Linux ELF — use Flatpak or `nix run` / `nix build .#baogui`.
+(`nix build .#android` → artifact) when cluster secret `NIXBUILD_TOKEN` or
+`OPENBAO_TOKEN` is set (UI: org `nandi` → Default cluster → Secrets; pipeline
+`baogui-aopjch`). Do not upload a naked Linux ELF — use Flatpak or `nix run` /
+`nix build .#baogui`.
 
 ## Cursor Cloud specific instructions
 
