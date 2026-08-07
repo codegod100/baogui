@@ -296,8 +296,27 @@ steps:
         | tr ' ' '\n' | awk -F: 'NF{print "trusted-key:", $$1}' || true
       nix show-config 2>/dev/null | grep -E '^(substituters|extra-substituters|builders) =' || true
 
-      echo "--- :nix: nix build .#android"
-      nix build ".#android" -L --print-build-logs --out-link result-android
+      # CI-recommended path (docs.nixbuild.net/remote-builds): build in the
+      # nixbuild remote store, then copy the APK closure back. Avoids cold-agent
+      # local-store "unexpectedly invalid" / unsigned-substitute noise from
+      # treating ssh://nixbuild as a local substituter for unsigned paths.
+      echo "--- :nix: nix build .#android (ssh-ng remote store)"
+      out_json="$$(mktemp)"
+      nix build \
+        --builders '' \
+        --max-jobs 1 \
+        --eval-store auto \
+        --store ssh-ng://nixbuild \
+        ".#android" -L --print-build-logs --json | tee "$$out_json"
+      out_path="$$(jq -r '.[0].outputs.out // empty' "$$out_json")"
+      [[ -n "$$out_path" ]] || {
+        echo "nix build produced no out path; json:" >&2
+        cat "$$out_json" >&2 || true
+        exit 1
+      }
+      echo "Copying $$out_path from nixbuild → local store"
+      nix copy --from ssh-ng://nixbuild "$$out_path"
+      ln -sfn "$$out_path" result-android
 
       [[ -f result-android/baogui.apk ]] || {
         echo "APK missing under result-android/" >&2
