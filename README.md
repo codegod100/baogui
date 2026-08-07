@@ -81,6 +81,16 @@ Optional live check (needs credentials):
 cargo test live_read -- --ignored --nocapture
 ```
 
+## Packaging / CI artifacts
+
+| Package | Status | How to get / run |
+|---------|--------|------------------|
+| **APK** | Built by CI (`nix build .#android`) | Download `baogui.apk` from GitHub Actions or Buildkite (needs `NIXBUILD_TOKEN` / `OPENBAO_TOKEN`). Install on device / Waydroid / emulator. |
+| **Flatpak** | **Not in this repo yet** | Intended Wayland desktop distribution (runtime ships libs). No `org.openbao.baogui` Flatpak manifest here — do not use a naked CI `baogui` ELF. |
+| **Nix desktop** | Local / flake | `nix run` or `nix build .#baogui` — wraps with Wayland/`LD_LIBRARY_PATH` from nixpkgs. Prefer this on NixOS until Flatpak lands. |
+
+Buildkite (`.buildkite/pipeline.yml`) runs host check always, then APK upload when secrets exist. It does **not** publish a raw `target/release/baogui` binary (that fails with `NoWaylandLib` without system Wayland libs / wrong glibc).
+
 ## Nix
 
 | Output | Role |
@@ -88,6 +98,7 @@ cargo test live_read -- --ignored --nocapture
 | `apps.default` / `apps.baogui` | Stage `.desktop`/icons, `cargo run` (host rustup) |
 | `apps.build` | `cargo build` only (host rustup) |
 | `packages.default` / `packages.baogui` | Pure wrapped binary + desktop entry + icons |
+| `packages.android` | Pure APK (`baogui.apk`, aarch64) |
 | `devShells.default` | egui runtime libs + pkg-config/glib (host rustc) |
 
 Flake input `vidya` is staged for `nix build` only. Day-to-day `nix run` needs sibling `../vidya` for the Cargo path dep.

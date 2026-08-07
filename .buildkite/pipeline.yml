@@ -1,7 +1,13 @@
 # Buildkite CI for Radicle Garden (buildkite-adapter).
-# Mirrors .github/workflows/ci.yml "check" job + uploads a Linux desktop
-# release binary via buildkite-agent artifact upload (no secrets required).
-# APK stays on GitHub Actions (nixbuild/OpenBao) — not on hosted BK agents.
+# Mirrors .github/workflows/ci.yml "check" + optional APK artifact upload.
+#
+# Artifacts: APK (nix build .#android) when nixbuild credentials exist.
+# Flatpak is the intended desktop/Wayland package — not in-repo yet; do NOT
+# upload a naked cargo release binary (NoWaylandLib on plain Linux).
+#
+# Secrets (Buildkite pipeline/org env): NIXBUILD_TOKEN, or OPENBAO_TOKEN that
+# can read secret/data/ai-api-keys → NIXBUILD_TOKEN (same as GitHub Actions).
+#
 # Agents must reach https://nandi.radicle.garden/{rid}.git and
 # https://tangled.org/nandi.uk/vidya.
 # Author email must match a verified Buildkite personal email (or GitHub-linked noreply).
@@ -46,6 +52,71 @@ steps:
       cargo clippy -- -D warnings
       cargo test
 
-      # Desktop Linux binary — same egui libs as check; no nixbuild/APK secrets.
-      cargo build --release
-      buildkite-agent artifact upload target/release/baogui
+  - label: ":android: APK"
+    key: apk
+    depends_on: check
+    command: |
+      set -euo pipefail
+
+      # Prefer Buildkite secret NIXBUILD_TOKEN; else OPENBAO_TOKEN → fetch from OpenBao
+      # (same path as .github/workflows/ci.yml).
+      if [[ -z "$${NIXBUILD_TOKEN:-}" && -n "$${OPENBAO_TOKEN:-}" ]]; then
+        chmod +x scripts/fetch-openbao-env.sh
+        # shellcheck disable=SC1091
+        eval "$$(./scripts/fetch-openbao-env.sh --export --keys NIXBUILD_TOKEN)"
+      fi
+
+      if [[ -z "$${NIXBUILD_TOKEN:-}" ]]; then
+        echo "--- :warning: Skipping APK (no NIXBUILD_TOKEN / OPENBAO_TOKEN)"
+        echo "Set Buildkite secret NIXBUILD_TOKEN (or OPENBAO_TOKEN for OpenBao fetch)."
+        echo "Desktop Flatpak is not packaged in this repo yet — see README Packaging."
+        exit 0
+      fi
+
+      if ! command -v nix >/dev/null 2>&1; then
+        curl --proto '=https' --tlsv1.2 -sSf -L \
+          https://install.determinate.systems/nix \
+          | sh -s -- install linux --no-confirm --init none
+        # shellcheck disable=SC1091
+        . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh || true
+        export PATH="/nix/var/nix/profiles/default/bin:$$PATH"
+      fi
+      command -v nix >/dev/null 2>&1 || {
+        echo "nix not on PATH after install" >&2
+        exit 1
+      }
+
+      # Auth token → SSH env for eu.nixbuild.net (docs.nixbuild.net/access-control).
+      mkdir -p "$$HOME/.ssh" "$$HOME/.config/nix"
+      chmod 700 "$$HOME/.ssh"
+      grep -q 'eu.nixbuild.net' "$$HOME/.ssh/known_hosts" 2>/dev/null || \
+        echo 'eu.nixbuild.net ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPIQCZc54poJ8vqawd8TraNryQeJnvH1eLpIDgbiqymM' \
+          >> "$$HOME/.ssh/known_hosts"
+      {
+        echo "Host eu.nixbuild.net"
+        echo "  User authtoken"
+        echo "  PreferredAuthentications none"
+        echo "  SetEnv NIXBUILDNET_TOKEN=$${NIXBUILD_TOKEN}"
+        echo "  ServerAliveInterval 60"
+        echo "  StrictHostKeyChecking yes"
+      } > "$$HOME/.ssh/config"
+      chmod 600 "$$HOME/.ssh/config"
+
+      {
+        echo "experimental-features = nix-command flakes"
+        echo "accept-flake-config = true"
+        echo "builders-use-substitutes = true"
+        echo "max-jobs = 0"
+        echo "builders = ssh://eu.nixbuild.net x86_64-linux - 100 1 big-parallel,benchmark,kvm,nixos-test,nixos-test-driver,ca-derivations ; ssh://eu.nixbuild.net aarch64-linux - 100 1 big-parallel,benchmark,kvm,nixos-test,nixos-test-driver,ca-derivations"
+      } > "$$HOME/.config/nix/nix.conf"
+
+      echo "--- :nix: nix build .#android"
+      nix build ".#android" -L --print-build-logs --out-link result-android
+
+      [[ -f result-android/baogui.apk ]] || {
+        echo "APK missing under result-android/" >&2
+        ls -la result-android >&2 || true
+        exit 1
+      }
+
+      buildkite-agent artifact upload result-android/baogui.apk
