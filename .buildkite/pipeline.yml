@@ -227,18 +227,17 @@ steps:
       sudo chmod 700 /root/.ssh
       sudo chmod 600 /root/.ssh/config /root/.ssh/known_hosts
 
-      # Verify authtoken SSH before spending build hours.
-      echo "--- :nixbuild: ssh eu.nixbuild.net hello"
-      ssh -F "$$ssh_config" nixbuild api hello >/dev/null
-
+      # Verify authtoken SSH before spending build hours (signing-key fetch = liveness).
+      echo "--- :nixbuild: fetch signing key"
       nixbuild_pubkey="$$(
         ssh -F "$$ssh_config" nixbuild api settings signing-key-for-builds --show \
           | jq -r '"\(.keyName):\(.publicKey)"'
       )"
       [[ -n "$$nixbuild_pubkey" && "$$nixbuild_pubkey" != ":" ]] || {
-        echo "failed to read nixbuild signing key" >&2
+        echo "failed to read nixbuild signing key (SSH/auth problem?)" >&2
         exit 1
       }
+      echo "nixbuild substituter pubkey loaded"
 
       # i686 needed for Android SDK (ncurses-abi5-compat); keep concurrency modest
       # to avoid SSH EOF storms on hosted agents.
