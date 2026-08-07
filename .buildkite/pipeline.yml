@@ -198,7 +198,6 @@ steps:
       ssh_known_hosts="$$(mktemp)"
       ssh_config="$$(mktemp)"
       builders_file="$$(mktemp)"
-      nix_conf="$$(mktemp)"
       echo 'eu.nixbuild.net ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPIQCZc54poJ8vqawd8TraNryQeJnvH1eLpIDgbiqymM' >"$$ssh_known_hosts"
       echo 'nixbuild ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPIQCZc54poJ8vqawd8TraNryQeJnvH1eLpIDgbiqymM' >>"$$ssh_known_hosts"
       {
@@ -237,7 +236,7 @@ steps:
         echo "failed to read nixbuild signing key (SSH/auth problem?)" >&2
         exit 1
       }
-      echo "nixbuild substituter pubkey loaded"
+      echo "nixbuild substituter pubkey: $${nixbuild_pubkey%%:*}"
 
       # i686 needed for Android SDK (ncurses-abi5-compat); keep concurrency modest
       # to avoid SSH EOF storms on hosted agents.
@@ -247,26 +246,66 @@ steps:
         echo 'nixbuild i686-linux - 32 1 big-parallel,benchmark,kvm,nixos-test,ca-derivations'
       } >"$$builders_file"
 
+      # Multi-user nix-daemon only trusts keys from *system* nix.conf.
+      # User ~/.config/nix or NIX_CONFIG extra-trusted-public-keys are ignored
+      # (hence "not signed by any of the keys in trusted-public-keys").
+      # Put builders + keys under /etc/nix (root-readable) like nixbuild-action's
+      # NIX_CONFIG include, but durable for the daemon.
+      sudo mkdir -p /etc/nix
+      sudo cp "$$builders_file" /etc/nix/baogui-nixbuild-builders
+      sudo chmod 644 /etc/nix/baogui-nixbuild-builders
       {
         echo 'experimental-features = nix-command flakes'
         echo 'accept-flake-config = true'
         echo 'builders-use-substitutes = true'
         echo 'require-sigs = true'
         echo 'max-jobs = 0'
-        echo "builders = @$$builders_file"
+        echo 'builders = @/etc/nix/baogui-nixbuild-builders'
         echo 'extra-substituters = ssh://nixbuild?priority=100'
         echo "extra-trusted-public-keys = $$nixbuild_pubkey"
-      } >"$$nix_conf"
-      mkdir -p "$$HOME/.config/nix"
-      cp "$$nix_conf" "$$HOME/.config/nix/nix.conf"
-      # Daemon reads system conf; merge carefully (append include).
-      if [[ -f /etc/nix/nix.conf ]]; then
-        echo "include $$nix_conf" | sudo tee -a /etc/nix/nix.conf >/dev/null
-      else
-        sudo mkdir -p /etc/nix
-        sudo cp "$$nix_conf" /etc/nix/nix.conf
+        # Also set trusted-public-keys append-style via extra-*; some installs
+        # only honor trusted-* when written in the daemon's conf itself.
+      } | sudo tee /etc/nix/baogui-nixbuild.conf >/dev/null
+      sudo chmod 644 /etc/nix/baogui-nixbuild.conf
+
+      # Ensure system nix.conf includes our snippet (idempotent).
+      if ! sudo grep -q 'baogui-nixbuild.conf' /etc/nix/nix.conf 2>/dev/null; then
+        echo 'include /etc/nix/baogui-nixbuild.conf' | sudo tee -a /etc/nix/nix.conf >/dev/null
       fi
-      export NIX_CONFIG="include $$nix_conf"
+      # Determinate may already list cache.nixos.org keys; append nixbuild explicitly
+      # in case include order / trusted-user rules drop extra-* from includes.
+      if ! sudo grep -qF "$$nixbuild_pubkey" /etc/nix/nix.conf 2>/dev/null; then
+        echo "extra-trusted-public-keys = $$nixbuild_pubkey" | sudo tee -a /etc/nix/nix.conf >/dev/null
+      fi
+      if ! sudo grep -q 'ssh://nixbuild' /etc/nix/nix.conf 2>/dev/null; then
+        echo 'extra-substituters = ssh://nixbuild?priority=100' | sudo tee -a /etc/nix/nix.conf >/dev/null
+      fi
+
+      mkdir -p "$$HOME/.config/nix"
+      sudo cp /etc/nix/baogui-nixbuild.conf "$$HOME/.config/nix/nix.conf"
+      export NIX_CONFIG="include /etc/nix/baogui-nixbuild.conf"
+
+      # Restart daemon so it reloads trusted-public-keys / substituters.
+      echo "Restarting nix-daemon to load trusted nixbuild key"
+      if pid="$$(pgrep -f '[n]ix daemon' | head -1 || true)"; then
+        sudo kill "$$pid" 2>/dev/null || true
+        sleep 1
+      fi
+      sudo /nix/var/nix/profiles/default/bin/nix daemon >/tmp/nix-daemon.log 2>&1 &
+      for _ in $$(seq 1 30); do
+        [[ -S /nix/var/nix/daemon-socket/socket ]] && break
+        sleep 1
+      done
+      [[ -S /nix/var/nix/daemon-socket/socket ]] || {
+        echo "nix-daemon socket missing after restart; log:" >&2
+        cat /tmp/nix-daemon.log >&2 || true
+        exit 1
+      }
+      # Show effective trusted key *names* (not key material) for the build log.
+      echo "--- :nix: show-config trusted key names"
+      nix show-config 2>/dev/null | awk -F' = ' '/^trusted-public-keys =/{print; exit}' \
+        | tr ' ' '\n' | awk -F: 'NF{print "trusted-key:", $$1}' || true
+      nix show-config 2>/dev/null | grep -E '^(substituters|extra-substituters|builders) =' || true
 
       echo "--- :nix: nix build .#android"
       nix build ".#android" -L --print-build-logs --out-link result-android
