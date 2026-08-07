@@ -1,6 +1,9 @@
 # Buildkite CI for Radicle Garden (buildkite-adapter).
-# Mirrors .github/workflows/ci.yml "check" job. Agents must reach
-# https://nandi.radicle.garden/{rid}.git and https://tangled.org/nandi.uk/vidya.
+# Mirrors .github/workflows/ci.yml "check" job + uploads a Linux desktop
+# release binary via buildkite-agent artifact upload (no secrets required).
+# APK stays on GitHub Actions (nixbuild/OpenBao) — not on hosted BK agents.
+# Agents must reach https://nandi.radicle.garden/{rid}.git and
+# https://tangled.org/nandi.uk/vidya.
 # Author email must match a verified Buildkite personal email (or GitHub-linked noreply).
 # Hosted queue key: auto (LINUX_AMD64_2X4).
 # Use $$ so Buildkite does not interpolate shell vars at pipeline-upload time.
@@ -42,3 +45,7 @@ steps:
 
       cargo clippy -- -D warnings
       cargo test
+
+      # Desktop Linux binary — same egui libs as check; no nixbuild/APK secrets.
+      cargo build --release
+      buildkite-agent artifact upload target/release/baogui
