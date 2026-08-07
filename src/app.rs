@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align, Key, Layout, RichText, ScrollArea, TextEdit, Vec2};
 use vidya::{
-    apply, body, button, card, central_page, data_table, destructive_button, dim_label,
-    icon_button, lead_trail, primary_button, table_text, text_field_multiline,
-    text_field_singleline, title, title_2, Col, ColKind, Icon, Theme,
+    apply, body, button, card, central_page, destructive_button, dim_label, grid_cols,
+    icon_button, lead_trail, primary_button, text_field_multiline, text_field_singleline, title,
+    title_2, ColSpec, Icon, Theme,
 };
 #[cfg(target_os = "android")]
 use vidya::reserve_system_chrome;
@@ -1383,6 +1383,9 @@ impl BaoGuiApp {
 
         let full_w = ui.available_width().max(1.0);
         let ctrl_h = th.spacing.control_height;
+        // Keep vertical pad modest so password bullets fit inside the field clip.
+        let field_margin = egui::Margin::symmetric(th.spacing.field_pad_x as i8, 4);
+        let field_h = ctrl_h;
         let act_w = ctrl_h * 2.0 + th.spacing.sm;
         let stack_kv = narrow || full_w < 420.0;
         let key_w = if stack_kv {
@@ -1394,11 +1397,6 @@ impl BaoGuiApp {
             (full_w - act_w - th.spacing.sm).max(80.0)
         } else {
             (full_w - key_w - act_w - th.spacing.md).max(80.0)
-        };
-        let row_h = if stack_kv {
-            ctrl_h * 2.0 + th.spacing.xs + 8.0
-        } else {
-            ctrl_h + 4.0
         };
 
         if !stack_kv {
@@ -1432,29 +1430,31 @@ impl BaoGuiApp {
         ScrollArea::vertical()
             .id_salt("kv_list")
             .auto_shrink([false, false])
-            .show_rows(ui, row_h, n, |ui, row_range| {
-                for i in row_range {
+            .show(ui, |ui| {
+                for i in 0..n {
                     let row = &mut self.kv_rows[i];
                     if stack_kv {
                         ui.vertical(|ui| {
                             ui.add_sized(
-                                [key_w, ctrl_h],
+                                [key_w, field_h],
                                 TextEdit::singleline(&mut row.key)
                                     .id_salt(("k", i))
+                                    .desired_width(key_w)
                                     .font(egui::TextStyle::Monospace)
                                     .hint_text("key")
-                                    .margin(th.text_edit_margin()),
+                                    .margin(field_margin),
                             );
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = th.spacing.sm;
                                 ui.add_sized(
-                                    [val_w, ctrl_h],
+                                    [val_w, field_h],
                                     TextEdit::singleline(&mut row.value)
                                         .id_salt(("v", i))
+                                        .desired_width(val_w)
                                         .password(!reveal)
                                         .font(egui::TextStyle::Monospace)
                                         .hint_text("value")
-                                        .margin(th.text_edit_margin()),
+                                        .margin(field_margin),
                                 );
                                 if icon_button(ui, th, Icon::Copy, "Copy value").clicked() {
                                     copy_val = Some(row.value.clone());
@@ -1472,23 +1472,25 @@ impl BaoGuiApp {
                     } else {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = th.spacing.sm;
-                            ui.set_height(row_h);
+                            ui.set_height(field_h + 4.0);
                             ui.add_sized(
-                                [key_w, ctrl_h],
+                                [key_w, field_h],
                                 TextEdit::singleline(&mut row.key)
                                     .id_salt(("k", i))
+                                    .desired_width(key_w)
                                     .font(egui::TextStyle::Monospace)
                                     .hint_text("key")
-                                    .margin(th.text_edit_margin()),
+                                    .margin(field_margin),
                             );
                             ui.add_sized(
-                                [val_w, ctrl_h],
+                                [val_w, field_h],
                                 TextEdit::singleline(&mut row.value)
                                     .id_salt(("v", i))
+                                    .desired_width(val_w)
                                     .password(!reveal)
                                     .font(egui::TextStyle::Monospace)
                                     .hint_text("value")
-                                    .margin(th.text_edit_margin()),
+                                    .margin(field_margin),
                             );
                             if icon_button(ui, th, Icon::Copy, "Copy value").clicked() {
                                 copy_val = Some(row.value.clone());
@@ -1669,69 +1671,70 @@ impl BaoGuiApp {
                     }
                 });
         } else {
-            let cols = [
-                Col {
-                    header: "Path",
-                    kind: ColKind::Flex,
-                },
-                Col {
-                    header: "Key",
-                    kind: ColKind::Flex,
-                },
-                Col {
-                    header: "Value",
-                    kind: ColKind::Flex,
-                },
-            ];
-
-            ScrollArea::both()
+            // Pin width before scrolling: ScrollArea::both() gives infinite
+            // available_width, so Flex columns blow out and the Value column
+            // lands off-screen to the right.
+            let avail = ui.available_width().max(1.0);
+            ScrollArea::vertical()
                 .id_salt("search_hits")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    data_table(ui, th, "search_hits_table", &cols, |ui, i| {
-                        let hit = &hits[i];
-                        let path_resp = ui
-                            .add(
-                                egui::Label::new(
-                                    RichText::new(&hit.path)
-                                        .size(th.type_scale.body)
-                                        .monospace()
-                                        .color(th.palette.accent),
-                                )
-                                .truncate()
-                                .sense(egui::Sense::click()),
-                            )
-                            .on_hover_text(&hit.path);
-                        if path_resp.clicked() {
-                            open_path = Some(hit.path.clone());
-                        }
-                        if path_resp.hovered() {
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                        }
+                    ui.set_width(avail);
+                    let cols = [ColSpec::Flex, ColSpec::Flex, ColSpec::Flex];
+                    grid_cols(ui, th, "search_hits_table", &cols, |g| {
+                        g.row(|r| {
+                            r.heading("Path");
+                            r.heading("Key");
+                            r.heading("Value");
+                        });
+                        for hit in &hits {
+                            g.row(|r| {
+                                let path = hit.path.as_str();
+                                let key = hit.key.as_str();
+                                let value = hit.value.as_str();
+                                let shown = if reveal { value } else { "••••••••" };
 
-                        table_text(ui, th, &hit.key, true);
-
-                        let shown = if reveal {
-                            hit.value.as_str()
-                        } else {
-                            "••••••••"
-                        };
-                        let val_resp = ui
-                            .add(
-                                egui::Label::new(
-                                    RichText::new(shown)
-                                        .size(th.type_scale.body)
-                                        .monospace()
-                                        .color(th.palette.text),
-                                )
-                                .truncate()
-                                .sense(egui::Sense::click()),
-                            )
-                            .on_hover_text(if reveal { shown } else { "Copy value" });
-                        if val_resp.clicked() {
-                            copy_val = Some(hit.value.clone());
+                                r.cell(|ui| {
+                                    let path_resp = ui
+                                        .add(
+                                            egui::Label::new(
+                                                RichText::new(path)
+                                                    .size(th.type_scale.body)
+                                                    .monospace()
+                                                    .color(th.palette.accent),
+                                            )
+                                            .truncate()
+                                            .sense(egui::Sense::click()),
+                                        )
+                                        .on_hover_text(path);
+                                    if path_resp.clicked() {
+                                        open_path = Some(path.to_string());
+                                    }
+                                    if path_resp.hovered() {
+                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                    }
+                                });
+                                r.text(key);
+                                r.cell(|ui| {
+                                    let val_resp = ui
+                                        .add(
+                                            egui::Label::new(
+                                                RichText::new(shown)
+                                                    .size(th.type_scale.body)
+                                                    .monospace()
+                                                    .color(th.palette.text),
+                                            )
+                                            .truncate()
+                                            .sense(egui::Sense::click()),
+                                        )
+                                        .on_hover_text(if reveal { shown } else { "Copy value" });
+                                    if val_resp.clicked() {
+                                        copy_val = Some(value.to_string());
+                                    }
+                                });
+                            });
                         }
-                    }, n);
+                    });
                 });
         }
 
