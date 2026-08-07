@@ -40,9 +40,22 @@ ensure_builder() {
   fi
 }
 
+# Smoke-test bubblewrap (flatpak-builder needs this). Hosted CI often blocks
+# pivot_root; callers can wrap this script in `docker run --privileged` instead.
+bwrap_ok() {
+  command -v bwrap >/dev/null 2>&1 || return 1
+  bwrap --ro-bind / / --proc /proc --dev /dev --unshare-user --uid 0 --gid 0 \
+    /bin/true >/dev/null 2>&1
+}
+
 cmd_build() {
   ensure_builder
   ensure_vidya
+  if ! bwrap_ok; then
+    echo "warning: bubblewrap cannot create a user namespace (pivot_root/userns)." >&2
+    echo "  On Buildkite hosted agents, use the privileged Docker path in" >&2
+    echo "  .buildkite/pipeline.yml (ghcr.io/flathub-infra/flatpak-github-actions)." >&2
+  fi
   mkdir -p "$BUILD_DIR" "$REPO_DIR"
   echo "→ flatpak-builder (install deps from flathub, export repo)"
   flatpak-builder \

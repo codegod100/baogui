@@ -70,27 +70,36 @@ steps:
         git clone --depth 1 https://tangled.org/nandi.uk/vidya "$$vidya_dir"
       fi
 
-      if command -v apt-get >/dev/null 2>&1; then
-        sudo apt-get update
-        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-          flatpak flatpak-builder ostree appstream
-      fi
-      command -v flatpak >/dev/null 2>&1 || {
-        echo "flatpak not on PATH after install" >&2
-        exit 1
-      }
-      command -v flatpak-builder >/dev/null 2>&1 || {
-        echo "flatpak-builder not on PATH after install" >&2
-        exit 1
-      }
-
-      # Prefer user install on hosted agents (no system privileges for remotes).
-      flatpak remote-add --if-not-exists --user flathub \
-        https://dl.flathub.org/repo/flathub.flatpakrepo
-
-      echo "--- :package: flatpak-builder org.openbao.baogui"
       chmod +x scripts/flatpak.sh
-      ./scripts/flatpak.sh build
+
+      # Hosted agents: flatpak-builder's bubblewrap fails with
+      #   bwrap: pivot_root: Operation not permitted
+      # (user namespaces / nested sandbox blocked). Same fix as Flathub GHA:
+      # build inside a privileged Freedesktop flatpak image. Mount baogui at
+      # /baogui and sibling vidya at /vidya so manifest path ../../vidya works.
+      command -v docker >/dev/null 2>&1 || {
+        echo "docker required for Flatpak CI (host bwrap cannot pivot_root)" >&2
+        exit 1
+      }
+
+      image=ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08
+      echo "--- :docker: pull $$image"
+      docker pull "$$image"
+
+      echo "--- :package: flatpak-builder org.openbao.baogui (privileged container)"
+      docker run --rm --privileged \
+        --volume "$$PWD:/baogui:rw" \
+        --volume "$$vidya_dir:/vidya:rw" \
+        --workdir /baogui \
+        "$$image" \
+        bash -lc 'set -euo pipefail
+          flatpak remote-add --if-not-exists --user flathub \
+            https://dl.flathub.org/repo/flathub.flatpakrepo
+          ./scripts/flatpak.sh build
+        '
+
+      # Container may create root-owned artifacts; agent upload needs readable files.
+      sudo chown -R "$$(id -u):$$(id -g)" org.openbao.baogui.flatpak flatpak-build flatpak-repo .flatpak-builder 2>/dev/null || true
 
       [[ -f org.openbao.baogui.flatpak ]] || {
         echo "Flatpak bundle missing" >&2
