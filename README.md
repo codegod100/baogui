@@ -86,10 +86,29 @@ cargo test live_read -- --ignored --nocapture
 | Package | Status | How to get / run |
 |---------|--------|------------------|
 | **APK** | Built by CI (`nix build .#android`) | Download `baogui.apk` from GitHub Actions or Buildkite (needs `NIXBUILD_TOKEN` / `OPENBAO_TOKEN`). Install on device / Waydroid / emulator. |
-| **Flatpak** | **Not in this repo yet** | Intended Wayland desktop distribution (runtime ships libs). No `org.openbao.baogui` Flatpak manifest here — do not use a naked CI `baogui` ELF. |
-| **Nix desktop** | Local / flake | `nix run` or `nix build .#baogui` — wraps with Wayland/`LD_LIBRARY_PATH` from nixpkgs. Prefer this on NixOS until Flatpak lands. |
+| **Flatpak** | Manifest + CI bundle | `flatpak/org.openbao.baogui.yml` — Wayland runtime ships libs. Download `org.openbao.baogui.flatpak` from Buildkite, or build locally (below). |
+| **Nix desktop** | Local / flake | `nix run` or `nix build .#baogui` — wraps with Wayland/`LD_LIBRARY_PATH` from nixpkgs. |
 
-Buildkite (`.buildkite/pipeline.yml`) runs host check always, then APK upload when secrets exist. It does **not** publish a raw `target/release/baogui` binary (that fails with `NoWaylandLib` without system Wayland libs / wrong glibc).
+Buildkite (`.buildkite/pipeline.yml`) runs host check always, then Flatpak bundle upload, then APK upload when secrets exist. It does **not** publish a raw `target/release/baogui` ELF (that fails with `NoWaylandLib` without system Wayland libs / wrong glibc).
+
+### Flatpak (local)
+
+Needs [Flatpak](https://flatpak.org/) + `flatpak-builder` + `appstreamcli`, a Flathub remote, and sibling `../vidya` (same path dep as `cargo run`).
+
+```bash
+# once
+flatpak remote-add --if-not-exists --user flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+
+# NixOS / missing host tools:
+nix-shell -p flatpak-builder appstream --run './scripts/flatpak.sh build'
+
+./scripts/flatpak.sh build     # → org.openbao.baogui.flatpak
+./scripts/flatpak.sh install   # install bundle (or build+install)
+flatpak run org.openbao.baogui
+# or: ./scripts/flatpak.sh run
+```
+
+Manifest: `flatpak/org.openbao.baogui.yml` (Freedesktop Platform/Sdk **25.08** + `rust-stable` extension). Build arranges `baogui/` + `vidya/` so `path = "../vidya"` works; crates.io is fetched at build time (`--share=network`). Desktop entry + hicolor icons + AppStream metainfo are installed into `/app/share/`.
 
 ## Nix
 

@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.openbao.baogui</id>
+  <name>BaoGUI</name>
+  <summary>Simple OpenBao (Vault-compatible) secrets client</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <developer_name>BaoGUI contributors</developer_name>
+  <description>
+    <p>
+      BaoGUI is a lightweight desktop client for OpenBao (and Vault-compatible
+      KV v2 mounts). Browse folders, read and edit secrets, mask values, and
+      connect with a stored token or OIDC browser login.
+    </p>
+  </description>
+  <launchable type="desktop-id">org.openbao.baogui.desktop</launchable>
+  <url type="homepage">https://openbao.org/</url>
+  <screenshots>
+    <screenshot type="default">
+      <caption>Browse and edit OpenBao KV secrets</caption>
+      <image>https://raw.githubusercontent.com/codegod100/baogui/main/data/icons/org.openbao.baogui.png</image>
+    </screenshot>
+  </screenshots>
+  <releases>
+    <release version="0.1.0" date="2026-08-07"/>
+  </releases>
+  <content_rating type="oars-1.1"/>
+  <recommends>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </recommends>
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+</component>

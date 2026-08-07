@@ -1,0 +1,79 @@
+# Flatpak manifest for BaoGUI (Flathub-style layout).
+# Build from repo root (needs sibling ../vidya for the Cargo path dep):
+#   ./scripts/flatpak.sh build
+# See README → Packaging / Flatpak.
+#
+# Strategy: flatpak-builder + Freedesktop Sdk rust-stable extension.
+# Sources are arranged as baogui/ + vidya/ so Cargo.toml's path = "../vidya" works.
+# Network is shared at build time for crates.io (no cargo-sources.json yet).
+
+id: org.openbao.baogui
+runtime: org.freedesktop.Platform
+runtime-version: "25.08"
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: baogui
+finish-args:
+  # Wayland first; X11 fallback for older sessions
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  # GPU (egui/glow)
+  - --device=dri
+  # OpenBao / Vault HTTP API + OIDC browser callback flow
+  - --share=network
+  # Read ~/.vault-token / ~/.bao-token (override with BAO_TOKEN if preferred)
+  - --filesystem=home:ro
+
+modules:
+  - name: baogui
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/baogui/cargo
+      build-args:
+        - --share=network
+    build-commands:
+      - cargo --version
+      - cd baogui && cargo build --release --locked --bin baogui
+      - install -Dm755 baogui/target/release/baogui /app/bin/baogui
+      - install -Dm644 baogui/data/share/applications/org.openbao.baogui.desktop /app/share/applications/org.openbao.baogui.desktop
+      - install -Dm644 baogui/data/share/metainfo/org.openbao.baogui.metainfo.xml /app/share/metainfo/org.openbao.baogui.metainfo.xml
+      - |
+        for size in 16 24 32 48 64 128 256 512; do
+          install -Dm644 \
+            "baogui/data/share/icons/hicolor/${size}x${size}/apps/org.openbao.baogui.png" \
+            "/app/share/icons/hicolor/${size}x${size}/apps/org.openbao.baogui.png"
+        done
+    sources:
+      - type: dir
+        path: ..
+        dest: baogui
+        skip:
+          - .flatpak-builder
+          - .git
+          - .github
+          - .jj
+          - .cursor
+          - .tangled
+          - .cargo
+          - target
+          - android/target
+          - result
+          - result-android
+          - result-baogui
+          - flatpak-build
+          - flatpak-repo
+          - org.openbao.baogui.flatpak
+      - type: dir
+        path: ../../vidya
+        dest: vidya
+        skip:
+          - .git
+          - target
+          - android-demo
+          - host
+          - examples
+          - docs

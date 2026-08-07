@@ -34,10 +34,10 @@ nix build .#baogui      # pure package (stages flake input vidya)
 
 App id / desktop icon: `org.openbao.baogui`.
 
-Buildkite (`.buildkite/pipeline.yml`): host `cargo clippy`/`test`, then optional APK
+Buildkite (`.buildkite/pipeline.yml`): host `cargo clippy`/`test`, Flatpak bundle
+(`flatpak/org.openbao.baogui.yml` → `org.openbao.baogui.flatpak`), then optional APK
 (`nix build .#android` → artifact) when `NIXBUILD_TOKEN` or `OPENBAO_TOKEN` is set.
-Do not upload a naked Linux ELF — Flatpak is the intended desktop/Wayland package
-but is not in-repo yet; until then use `nix run` / `nix build .#baogui` on desktop.
+Do not upload a naked Linux ELF — use Flatpak or `nix run` / `nix build .#baogui`.
 
 ## Cursor Cloud specific instructions
 

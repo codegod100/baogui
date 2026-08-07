@@ -3,3 +3,7 @@
 /result
 /result-*
 .direnv
+/.flatpak-builder
+/flatpak-build
+/flatpak-repo
+/org.openbao.baogui.flatpak

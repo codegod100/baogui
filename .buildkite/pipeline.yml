@@ -1,15 +1,17 @@
 # Buildkite CI for Radicle Garden (buildkite-adapter).
-# Mirrors .github/workflows/ci.yml "check" + optional APK artifact upload.
+# Mirrors .github/workflows/ci.yml "check" + optional APK artifact upload,
+# plus Flatpak desktop/Wayland bundle (org.openbao.baogui.flatpak).
 #
-# Artifacts: APK (nix build .#android) when nixbuild credentials exist.
-# Flatpak is the intended desktop/Wayland package — not in-repo yet; do NOT
-# upload a naked cargo release binary (NoWaylandLib on plain Linux).
+# Artifacts:
+#   - Flatpak: flatpak-builder → org.openbao.baogui.flatpak (always attempted)
+#   - APK: nix build .#android when nixbuild credentials exist
+# Do NOT upload a naked cargo release binary (NoWaylandLib on plain Linux).
 #
 # Secrets (Buildkite pipeline/org env): NIXBUILD_TOKEN, or OPENBAO_TOKEN that
 # can read secret/data/ai-api-keys → NIXBUILD_TOKEN (same as GitHub Actions).
 #
 # Agents must reach https://nandi.radicle.garden/{rid}.git and
-# https://tangled.org/nandi.uk/vidya.
+# https://tangled.org/nandi.uk/vidya, plus Flathub for Flatpak SDK/runtime.
 # Author email must match a verified Buildkite personal email (or GitHub-linked noreply).
 # Hosted queue key: auto (LINUX_AMD64_2X4).
 # Use $$ so Buildkite does not interpolate shell vars at pipeline-upload time.
@@ -52,6 +54,48 @@ steps:
       cargo clippy -- -D warnings
       cargo test
 
+  - label: ":package: Flatpak"
+    key: flatpak
+    depends_on: check
+    timeout_in_minutes: 120
+    command: |
+      set -euo pipefail
+
+      vidya_dir="$$(dirname "$$PWD")/vidya"
+      if [[ ! -f "$$vidya_dir/Cargo.toml" ]]; then
+        git clone --depth 1 https://tangled.org/nandi.uk/vidya "$$vidya_dir"
+      fi
+
+      if command -v apt-get >/dev/null 2>&1; then
+        sudo apt-get update
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+          flatpak flatpak-builder ostree appstream
+      fi
+      command -v flatpak >/dev/null 2>&1 || {
+        echo "flatpak not on PATH after install" >&2
+        exit 1
+      }
+      command -v flatpak-builder >/dev/null 2>&1 || {
+        echo "flatpak-builder not on PATH after install" >&2
+        exit 1
+      }
+
+      # Prefer user install on hosted agents (no system privileges for remotes).
+      flatpak remote-add --if-not-exists --user flathub \
+        https://dl.flathub.org/repo/flathub.flatpakrepo
+
+      echo "--- :package: flatpak-builder org.openbao.baogui"
+      chmod +x scripts/flatpak.sh
+      ./scripts/flatpak.sh build
+
+      [[ -f org.openbao.baogui.flatpak ]] || {
+        echo "Flatpak bundle missing" >&2
+        ls -la >&2 || true
+        exit 1
+      }
+
+      buildkite-agent artifact upload org.openbao.baogui.flatpak
+
   - label: ":android: APK"
     key: apk
     depends_on: check
@@ -69,7 +113,7 @@ steps:
       if [[ -z "$${NIXBUILD_TOKEN:-}" ]]; then
         echo "--- :warning: Skipping APK (no NIXBUILD_TOKEN / OPENBAO_TOKEN)"
         echo "Set Buildkite secret NIXBUILD_TOKEN (or OPENBAO_TOKEN for OpenBao fetch)."
-        echo "Desktop Flatpak is not packaged in this repo yet — see README Packaging."
+        echo "Desktop Flatpak is built in the Flatpak step (org.openbao.baogui.flatpak)."
         exit 0
       fi
 
