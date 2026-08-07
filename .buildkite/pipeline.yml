@@ -152,6 +152,8 @@ steps:
       fi
 
       echo "NIXBUILD_TOKEN is set — building APK via nixbuild.net"
+      # nixbuild-action uses NIXBUILDNET_TOKEN (+ legacy SetEnv token=).
+      export NIXBUILDNET_TOKEN="$${NIXBUILD_TOKEN}"
 
       if ! command -v nix >/dev/null 2>&1; then
         curl --proto '=https' --tlsv1.2 -sSf -L \
@@ -165,15 +167,21 @@ steps:
         echo "nix not on PATH after install" >&2
         exit 1
       }
+      if ! command -v jq >/dev/null 2>&1; then
+        if command -v apt-get >/dev/null 2>&1; then
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y jq
+        fi
+      fi
+      command -v jq >/dev/null 2>&1 || {
+        echo "jq required to read nixbuild signing key" >&2
+        exit 1
+      }
 
       # --init none leaves no systemd unit; start daemon so multi-user nix works.
       if [[ ! -S /nix/var/nix/daemon-socket/socket ]]; then
         echo "Starting nix-daemon (no systemd on hosted agent)"
-        if command -v sudo >/dev/null 2>&1; then
-          sudo /nix/var/nix/profiles/default/bin/nix daemon >/tmp/nix-daemon.log 2>&1 &
-        else
-          /nix/var/nix/profiles/default/bin/nix daemon >/tmp/nix-daemon.log 2>&1 &
-        fi
+        sudo /nix/var/nix/profiles/default/bin/nix daemon >/tmp/nix-daemon.log 2>&1 &
         for _ in $$(seq 1 30); do
           [[ -S /nix/var/nix/daemon-socket/socket ]] && break
           sleep 1
@@ -185,32 +193,81 @@ steps:
         }
       fi
 
-      # Auth token → SSH env for eu.nixbuild.net (docs.nixbuild.net/access-control).
-      mkdir -p "$$HOME/.ssh" "$$HOME/.config/nix"
-      chmod 700 "$$HOME/.ssh"
-      grep -q 'eu.nixbuild.net' "$$HOME/.ssh/known_hosts" 2>/dev/null || \
-        echo 'eu.nixbuild.net ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPIQCZc54poJ8vqawd8TraNryQeJnvH1eLpIDgbiqymM' \
-          >> "$$HOME/.ssh/known_hosts"
+      # Mirror nixbuild/nixbuild-action SSH + builders setup so the daemon
+      # (root) and the job user share the same authtoken config.
+      ssh_known_hosts="$$(mktemp)"
+      ssh_config="$$(mktemp)"
+      builders_file="$$(mktemp)"
+      nix_conf="$$(mktemp)"
+      echo 'eu.nixbuild.net ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPIQCZc54poJ8vqawd8TraNryQeJnvH1eLpIDgbiqymM' >"$$ssh_known_hosts"
+      echo 'nixbuild ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPIQCZc54poJ8vqawd8TraNryQeJnvH1eLpIDgbiqymM' >>"$$ssh_known_hosts"
       {
-        echo "Host eu.nixbuild.net"
-        echo "  User authtoken"
-        echo "  PreferredAuthentications none"
-        echo "  SetEnv NIXBUILDNET_TOKEN=$${NIXBUILD_TOKEN}"
-        echo "  ServerAliveInterval 60"
-        echo "  StrictHostKeyChecking yes"
-      } > "$$HOME/.ssh/config"
-      chmod 600 "$$HOME/.ssh/config"
+        echo 'Host nixbuild eu.nixbuild.net'
+        echo '  HostName eu.nixbuild.net'
+        echo '  HostKeyAlias nixbuild'
+        echo '  LogLevel ERROR'
+        echo '  StrictHostKeyChecking yes'
+        echo "  UserKnownHostsFile $$ssh_known_hosts"
+        echo '  ControlPath none'
+        echo '  ServerAliveInterval 60'
+        echo '  IPQoS throughput'
+        echo '  PreferredAuthentications none'
+        echo '  User authtoken'
+        echo '  SendEnv NIXBUILDNET_TOKEN'
+        # Legacy + documented token env (docs.nixbuild.net/access-control).
+        echo "  SetEnv NIXBUILDNET_TOKEN=$${NIXBUILDNET_TOKEN} token=$${NIXBUILDNET_TOKEN}"
+      } >"$$ssh_config"
+      chmod 600 "$$ssh_config" "$$ssh_known_hosts"
+      export NIX_SSHOPTS="-F$$ssh_config"
 
-      # Android SDK pull-in needs i686-linux (ncurses-abi5-compat); nixbuild-action
-      # on GHA registers these platforms — mirror that here with max-jobs=0.
-      nixbuild_feats="big-parallel,benchmark,kvm,nixos-test,nixos-test-driver,ca-derivations"
+      # Also install for root so nix-daemon remote builds authenticate.
+      sudo mkdir -p /root/.ssh
+      sudo cp "$$ssh_config" /root/.ssh/config
+      sudo cp "$$ssh_known_hosts" /root/.ssh/known_hosts
+      sudo chmod 700 /root/.ssh
+      sudo chmod 600 /root/.ssh/config /root/.ssh/known_hosts
+
+      # Verify authtoken SSH before spending build hours.
+      echo "--- :nixbuild: ssh eu.nixbuild.net hello"
+      ssh -F "$$ssh_config" nixbuild api hello >/dev/null
+
+      nixbuild_pubkey="$$(
+        ssh -F "$$ssh_config" nixbuild api settings signing-key-for-builds --show \
+          | jq -r '"\(.keyName):\(.publicKey)"'
+      )"
+      [[ -n "$$nixbuild_pubkey" && "$$nixbuild_pubkey" != ":" ]] || {
+        echo "failed to read nixbuild signing key" >&2
+        exit 1
+      }
+
+      # i686 needed for Android SDK (ncurses-abi5-compat); keep concurrency modest
+      # to avoid SSH EOF storms on hosted agents.
       {
-        echo "experimental-features = nix-command flakes"
-        echo "accept-flake-config = true"
-        echo "builders-use-substitutes = true"
-        echo "max-jobs = 0"
-        echo "builders = ssh://eu.nixbuild.net x86_64-linux - 100 1 $${nixbuild_feats} ; ssh://eu.nixbuild.net aarch64-linux - 100 1 $${nixbuild_feats} ; ssh://eu.nixbuild.net i686-linux - 100 1 $${nixbuild_feats}"
-      } > "$$HOME/.config/nix/nix.conf"
+        echo 'nixbuild x86_64-linux - 32 1 big-parallel,benchmark,kvm,nixos-test,ca-derivations'
+        echo 'nixbuild aarch64-linux - 32 1 big-parallel,benchmark,kvm,nixos-test,ca-derivations'
+        echo 'nixbuild i686-linux - 32 1 big-parallel,benchmark,kvm,nixos-test,ca-derivations'
+      } >"$$builders_file"
+
+      {
+        echo 'experimental-features = nix-command flakes'
+        echo 'accept-flake-config = true'
+        echo 'builders-use-substitutes = true'
+        echo 'require-sigs = true'
+        echo 'max-jobs = 0'
+        echo "builders = @$$builders_file"
+        echo 'extra-substituters = ssh://nixbuild?priority=100'
+        echo "extra-trusted-public-keys = $$nixbuild_pubkey"
+      } >"$$nix_conf"
+      mkdir -p "$$HOME/.config/nix"
+      cp "$$nix_conf" "$$HOME/.config/nix/nix.conf"
+      # Daemon reads system conf; merge carefully (append include).
+      if [[ -f /etc/nix/nix.conf ]]; then
+        echo "include $$nix_conf" | sudo tee -a /etc/nix/nix.conf >/dev/null
+      else
+        sudo mkdir -p /etc/nix
+        sudo cp "$$nix_conf" /etc/nix/nix.conf
+      fi
+      export NIX_CONFIG="include $$nix_conf"
 
       echo "--- :nix: nix build .#android"
       nix build ".#android" -L --print-build-logs --out-link result-android
