@@ -178,23 +178,10 @@ steps:
         exit 1
       }
 
-      # --init none leaves no systemd unit; start daemon so multi-user nix works.
-      if [[ ! -S /nix/var/nix/daemon-socket/socket ]]; then
-        echo "Starting nix-daemon (no systemd on hosted agent)"
-        sudo /nix/var/nix/profiles/default/bin/nix daemon >/tmp/nix-daemon.log 2>&1 &
-        for _ in $$(seq 1 30); do
-          [[ -S /nix/var/nix/daemon-socket/socket ]] && break
-          sleep 1
-        done
-        [[ -S /nix/var/nix/daemon-socket/socket ]] || {
-          echo "nix-daemon socket missing after start; log:" >&2
-          cat /tmp/nix-daemon.log >&2 || true
-          exit 1
-        }
-      fi
-
       # Mirror nixbuild/nixbuild-action SSH + builders setup so the daemon
       # (root) and the job user share the same authtoken config.
+      # Write /etc/nix *before* starting the daemon (no restart / pgrep — that
+      # previously SIGTERM'd the Buildkite job).
       ssh_known_hosts="$$(mktemp)"
       ssh_config="$$(mktemp)"
       builders_file="$$(mktemp)"
@@ -285,22 +272,24 @@ steps:
       sudo cp /etc/nix/baogui-nixbuild.conf "$$HOME/.config/nix/nix.conf"
       export NIX_CONFIG="include /etc/nix/baogui-nixbuild.conf"
 
-      # Restart daemon so it reloads trusted-public-keys / substituters.
-      echo "Restarting nix-daemon to load trusted nixbuild key"
-      if pid="$$(pgrep -f '[n]ix daemon' | head -1 || true)"; then
-        sudo kill "$$pid" 2>/dev/null || true
-        sleep 1
+      # --init none leaves no systemd unit; start daemon *after* system conf
+      # so trusted-public-keys / substituters are loaded on first boot.
+      if [[ ! -S /nix/var/nix/daemon-socket/socket ]]; then
+        echo "Starting nix-daemon with nixbuild trusted keys"
+        sudo /nix/var/nix/profiles/default/bin/nix daemon >/tmp/nix-daemon.log 2>&1 &
+        for _ in $$(seq 1 30); do
+          [[ -S /nix/var/nix/daemon-socket/socket ]] && break
+          sleep 1
+        done
+        [[ -S /nix/var/nix/daemon-socket/socket ]] || {
+          echo "nix-daemon socket missing after start; log:" >&2
+          cat /tmp/nix-daemon.log >&2 || true
+          exit 1
+        }
+      else
+        echo "nix-daemon already running (socket present)"
       fi
-      sudo /nix/var/nix/profiles/default/bin/nix daemon >/tmp/nix-daemon.log 2>&1 &
-      for _ in $$(seq 1 30); do
-        [[ -S /nix/var/nix/daemon-socket/socket ]] && break
-        sleep 1
-      done
-      [[ -S /nix/var/nix/daemon-socket/socket ]] || {
-        echo "nix-daemon socket missing after restart; log:" >&2
-        cat /tmp/nix-daemon.log >&2 || true
-        exit 1
-      }
+
       # Show effective trusted key *names* (not key material) for the build log.
       echo "--- :nix: show-config trusted key names"
       nix show-config 2>/dev/null | awk -F' = ' '/^trusted-public-keys =/{print; exit}' \
