@@ -166,6 +166,25 @@ steps:
         exit 1
       }
 
+      # --init none leaves no systemd unit; start daemon so multi-user nix works.
+      if [[ ! -S /nix/var/nix/daemon-socket/socket ]]; then
+        echo "Starting nix-daemon (no systemd on hosted agent)"
+        if command -v sudo >/dev/null 2>&1; then
+          sudo /nix/var/nix/profiles/default/bin/nix daemon >/tmp/nix-daemon.log 2>&1 &
+        else
+          /nix/var/nix/profiles/default/bin/nix daemon >/tmp/nix-daemon.log 2>&1 &
+        fi
+        for _ in $$(seq 1 30); do
+          [[ -S /nix/var/nix/daemon-socket/socket ]] && break
+          sleep 1
+        done
+        [[ -S /nix/var/nix/daemon-socket/socket ]] || {
+          echo "nix-daemon socket missing after start; log:" >&2
+          cat /tmp/nix-daemon.log >&2 || true
+          exit 1
+        }
+      fi
+
       # Auth token → SSH env for eu.nixbuild.net (docs.nixbuild.net/access-control).
       mkdir -p "$$HOME/.ssh" "$$HOME/.config/nix"
       chmod 700 "$$HOME/.ssh"
@@ -182,12 +201,15 @@ steps:
       } > "$$HOME/.ssh/config"
       chmod 600 "$$HOME/.ssh/config"
 
+      # Android SDK pull-in needs i686-linux (ncurses-abi5-compat); nixbuild-action
+      # on GHA registers these platforms — mirror that here with max-jobs=0.
+      nixbuild_feats="big-parallel,benchmark,kvm,nixos-test,nixos-test-driver,ca-derivations"
       {
         echo "experimental-features = nix-command flakes"
         echo "accept-flake-config = true"
         echo "builders-use-substitutes = true"
         echo "max-jobs = 0"
-        echo "builders = ssh://eu.nixbuild.net x86_64-linux - 100 1 big-parallel,benchmark,kvm,nixos-test,nixos-test-driver,ca-derivations ; ssh://eu.nixbuild.net aarch64-linux - 100 1 big-parallel,benchmark,kvm,nixos-test,nixos-test-driver,ca-derivations"
+        echo "builders = ssh://eu.nixbuild.net x86_64-linux - 100 1 $${nixbuild_feats} ; ssh://eu.nixbuild.net aarch64-linux - 100 1 $${nixbuild_feats} ; ssh://eu.nixbuild.net i686-linux - 100 1 $${nixbuild_feats}"
       } > "$$HOME/.config/nix/nix.conf"
 
       echo "--- :nix: nix build .#android"
